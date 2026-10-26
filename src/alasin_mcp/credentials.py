@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import importlib
@@ -95,6 +96,10 @@ class UserDelegatedProvider:
         self._store = store
         self._tenant_by_id = tenant_by_id
         self._transport = transport
+        # One refresh at a time per (tenant, subject): Forgejo rotates refresh
+        # tokens, so a second concurrent refresh would fail and must not wipe
+        # the token the first one just stored.
+        self._locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     def _http(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -112,6 +117,10 @@ class UserDelegatedProvider:
         if not isinstance(match_value, str) or not match_value:
             raise CredentialError(
                 f"the verified token has no '{oauth.match_claim}' claim to bind a Forgejo account"
+            )
+        if oauth.match_claim == "email" and not principal.email_verified:
+            raise CredentialError(
+                "binding a Forgejo account by email needs email_verified=true on the token"
             )
         verifier = secrets.token_urlsafe(48)
         challenge = (
@@ -152,18 +161,35 @@ class UserDelegatedProvider:
         )
         # Bind only if the Forgejo account is the caller's own: a link opened
         # by someone else must not attach their account to this subject.
-        async with self._http() as http:
-            resp = await http.get(
-                f"{tenant.api_base}/user",
-                headers={"Authorization": f"token {token['access_token']}"},
-            )
-        if resp.status_code != 200:
-            raise CredentialError("could not read the Forgejo account for the new token")
-        actual = resp.json().get(oauth.match_field)
-        if not isinstance(actual, str) or actual.casefold() != pending.match_value.casefold():
+        if not await self._account_matches(tenant, token["access_token"], pending.match_value):
             raise CredentialError("the Forgejo account does not match the verified caller")
         self._store.put_token(tenant.id, pending.subject, token)
         return tenant.id
+
+    async def _account_matches(self, tenant: TenantConfig, access: str, expected: str) -> bool:
+        oauth = tenant.oauth
+        assert oauth is not None
+        headers = {"Authorization": f"token {access}"}
+        async with self._http() as http:
+            if oauth.match_field == "email":
+                # Only an address Forgejo has verified counts.
+                resp = await http.get(f"{tenant.api_base}/user/emails", headers=headers)
+                body = _json_or_none(resp) if resp.status_code == 200 else None
+                if not isinstance(body, list):
+                    raise CredentialError("could not read the Forgejo account's email addresses")
+                return any(
+                    isinstance(e, dict)
+                    and e.get("verified") is True
+                    and isinstance(e.get("email"), str)
+                    and e["email"].casefold() == expected.casefold()
+                    for e in body
+                )
+            resp = await http.get(f"{tenant.api_base}/user", headers=headers)
+        body = _json_or_none(resp) if resp.status_code == 200 else None
+        if not isinstance(body, dict):
+            raise CredentialError("could not read the Forgejo account for the new token")
+        actual = body.get(oauth.match_field)
+        return isinstance(actual, str) and actual.casefold() == expected.casefold()
 
     async def _token_request(self, tenant: TenantConfig, form: dict[str, str]) -> dict[str, Any]:
         oauth = tenant.oauth
@@ -175,43 +201,92 @@ class UserDelegatedProvider:
         }
         async with self._http() as http:
             resp = await http.post(f"{tenant.forgejo_url}/login/oauth/access_token", data=payload)
+        body = _json_or_none(resp)
         if resp.status_code != 200:
-            raise CredentialError(f"Forgejo token endpoint returned {resp.status_code}")
-        body = resp.json()
+            code = body.get("error") if isinstance(body, dict) else None
+            raise TokenEndpointError(resp.status_code, code if isinstance(code, str) else None)
+        if not isinstance(body, dict):
+            raise CredentialError("Forgejo token endpoint returned a malformed response")
         access = body.get("access_token")
         if not isinstance(access, str) or not access:
             raise CredentialError("Forgejo token endpoint returned no access token")
-        expires_in = body.get("expires_in")
+        try:
+            expires_in = float(body.get("expires_in") or 0)
+        except (TypeError, ValueError):
+            raise CredentialError("Forgejo token endpoint returned a malformed expiry") from None
+        refresh = body.get("refresh_token")
         return {
             "access_token": access,
-            "refresh_token": body.get("refresh_token") or "",
-            "expires_at": time.time() + float(expires_in) if expires_in else 0.0,
+            "refresh_token": refresh if isinstance(refresh, str) else "",
+            "expires_at": time.time() + expires_in if expires_in > 0 else 0.0,
         }
+
+    def _read(self, tenant: TenantConfig, principal: Principal) -> dict[str, Any] | None:
+        try:
+            return self._store.get_token(tenant.id, principal.subject)
+        except DecryptionFailed:
+            self._store.delete_token(tenant.id, principal.subject)
+            return None
+
+    def _fresh(self, record: dict[str, Any]) -> bool:
+        expires_at = float(record.get("expires_at") or 0)
+        return not expires_at or expires_at - self.REFRESH_MARGIN >= time.time()
 
     async def credential(
         self, tenant: TenantConfig, principal: Principal, repo: RepoRef | None
     ) -> ForgejoCredential:
-        try:
-            record = self._store.get_token(tenant.id, principal.subject)
-        except DecryptionFailed:
-            self._store.delete_token(tenant.id, principal.subject)
-            record = None
+        record = self._read(tenant, principal)
         if record is None:
             raise AuthorizationRequired(self.authorization_url(tenant, principal))
-        expires_at = float(record.get("expires_at") or 0)
-        if expires_at and expires_at - self.REFRESH_MARGIN < time.time():
+        if not self._fresh(record):
+            record = await self._refresh(tenant, principal)
+        return ForgejoCredential(token=record["access_token"], mode=AuthMode.USER_DELEGATED)
+
+    async def _refresh(self, tenant: TenantConfig, principal: Principal) -> dict[str, Any]:
+        lock = self._locks.setdefault(principal.key, asyncio.Lock())
+        async with lock:
+            # Another call may have refreshed while this one waited.
+            record = self._read(tenant, principal)
+            if record is None:
+                raise AuthorizationRequired(self.authorization_url(tenant, principal))
+            if self._fresh(record):
+                return record
             refresh = record.get("refresh_token")
+            if not refresh:
+                self._store.delete_token(tenant.id, principal.subject)
+                raise AuthorizationRequired(self.authorization_url(tenant, principal))
             try:
-                if not refresh:
-                    raise CredentialError("no refresh token")
-                record = await self._token_request(
+                new = await self._token_request(
                     tenant, {"grant_type": "refresh_token", "refresh_token": refresh}
                 )
-            except CredentialError:
-                self._store.delete_token(tenant.id, principal.subject)
+            except TokenEndpointError as e:
+                if e.error != "invalid_grant":
+                    # A Forgejo outage is not a reason to forget the user's grant.
+                    raise CredentialError(
+                        f"Forgejo could not refresh the token right now ({e.status})"
+                    ) from None
+                current = self._read(tenant, principal)
+                if current is not None and current.get("refresh_token") == refresh:
+                    self._store.delete_token(tenant.id, principal.subject)
                 raise AuthorizationRequired(self.authorization_url(tenant, principal)) from None
-            self._store.put_token(tenant.id, principal.subject, record)
-        return ForgejoCredential(token=record["access_token"], mode=AuthMode.USER_DELEGATED)
+            if not new.get("refresh_token"):
+                new["refresh_token"] = refresh
+            self._store.put_token(tenant.id, principal.subject, new)
+            return new
+
+
+class TokenEndpointError(CredentialError):
+    def __init__(self, status: int, error: str | None):
+        super().__init__(f"Forgejo token endpoint returned {status} ({error or 'no error code'})")
+        self.status = status
+        self.error = error
+
+
+def _json_or_none(resp: httpx.Response) -> Any:
+    try:
+        return resp.json()
+    except ValueError:
+        return None
 
 
 # -- platform-scoped -------------------------------------------------------------------
@@ -279,8 +354,10 @@ class PlatformScopedProvider:
             raise CredentialError(
                 "platform-scoped tokens are per repository; this tool needs a repo argument"
             )
-        if not principal.email:
-            raise CredentialError("platform-scoped commits need an email claim on the caller")
+        if not principal.email or not principal.email_verified:
+            raise CredentialError(
+                "platform-scoped commits need a verified email claim (email_verified=true)"
+            )
         minted = await self._minter(tenant).mint(tenant, principal, repo)
         if minted.expires_at <= time.time():
             raise CredentialError("the platform minted an already expired token")

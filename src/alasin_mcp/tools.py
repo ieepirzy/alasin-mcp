@@ -16,11 +16,13 @@ is no tool to merge, delete, change settings, administer or read secrets.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import difflib
 import fnmatch
 import hashlib
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -30,14 +32,28 @@ import httpx
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from opentelemetry.trace import StatusCode
 from pydantic import BaseModel, Field
 from starlette.requests import Request
 
 from . import telemetry, validation
-from .audit import AuditSink, new_event
+from .audit import AuditSink, AuditUnavailable, new_event
 from .auth import PRINCIPAL_SCOPE_KEY, Principal
+from .branching import (
+    ApiBranchCreator,
+    BranchCreationError,
+    BranchCreator,
+    BranchRequest,
+    WebhookBranchCreator,
+)
 from .config import AuthMode, AuthorSource, TenantConfig
-from .credentials import CredentialError, CredentialProvider, ForgejoCredential, Identity
+from .credentials import (
+    AuthorizationRequired,
+    CredentialError,
+    CredentialProvider,
+    ForgejoCredential,
+    Identity,
+)
 from .forgejo import ForgejoClient, ForgejoError
 from .limits import PrincipalCache, RateLimited, TenantRateLimiter
 from .store import Store, WorkSession
@@ -54,6 +70,8 @@ commit_files to that branch (several files in one commit). You can't write to
 the default branch or to protected branches, and you can't merge, delete or
 change settings: a person reviews and merges your branch.
 """
+
+log = logging.getLogger("alasin_mcp.tools")
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
@@ -111,6 +129,21 @@ class Call:
     def client(self, cred: ForgejoCredential) -> ForgejoClient:
         return ForgejoClient(self.tenant.api_base, cred.token, transport=self.services.transport)
 
+    def record_attempt(self, action: str, **details: Any) -> None:
+        """Write an attempt event before a mutating call; refuse the write if it fails."""
+        event = {
+            **self.audit,
+            **new_event(),
+            "phase": "attempt",
+            "action": action,
+            **details,
+        }
+        try:
+            self.services.audit_sink.emit(event)
+        except Exception as e:
+            log.error("audit attempt event could not be recorded; refusing %s", action)
+            raise AuditUnavailable("the audit trail is unavailable; the write was not made") from e
+
     def check_repo(self, raw: str) -> RepoRef:
         repo = validation.repo(raw)
         self.audit["repo"] = repo.full_name
@@ -138,6 +171,11 @@ class Call:
         return ident
 
 
+def is_ci_path(tenant: TenantConfig, path: str) -> bool:
+    folded = path.casefold()
+    return any(folded.startswith(prefix.casefold()) for prefix in tenant.ci_paths)
+
+
 def repo_allowed(tenant: TenantConfig, full_name: str) -> bool:
     name = full_name.casefold()
     return any(fnmatch.fnmatchcase(name, pat.casefold()) for pat in tenant.repos)
@@ -154,6 +192,15 @@ class Services:
     session_ttl: float = 12 * 3600
     # Tests inject a transport; production uses the default network transport.
     transport: httpx.AsyncBaseTransport | None = None
+    branch_creators: dict[str, BranchCreator] = field(
+        default_factory=lambda: {"api": ApiBranchCreator(), "webhook": WebhookBranchCreator()}
+    )
+
+    def branch_creator(self, tenant: TenantConfig) -> BranchCreator:
+        creator = self.branch_creators.get(tenant.branch_creation)
+        if creator is None:
+            raise PolicyError(f"branch creation '{tenant.branch_creation}' is not available")
+        return creator
 
     async def call(
         self,
@@ -171,11 +218,13 @@ class Services:
             tenant = self.resolver.resolve(principal)
         except UnknownTenant:
             raise ToolError("the caller's tenant is not configured on this server") from None
+        client = request.client if isinstance(request, Request) else None
         event = new_event(
             tenant=principal.tenant,
             subject=principal.subject,
             principal_name=principal.name,
             principal_email=principal.email,
+            client_ip=client.host if client else None,
             tool=tool,
             session_id=session_id,
             arguments=_audit_arguments(arguments),
@@ -200,30 +249,47 @@ class Services:
             "alasin.session_id": session_id or "",
         }
         meta = ctx.request_context.meta
-        with telemetry.tool_span(tool, session_trace, attrs, meta) as span:
+        new_root = tool == "begin_change"
+        with telemetry.tool_span(tool, session_trace, attrs, meta, new_root=new_root) as span:
             trace_id, span_id = telemetry.ids(span)
             event["trace_id"] = session.trace_id if session else trace_id
             event["span_id"] = span_id
             call = Call(self, principal, tenant, session, request, audit=event)
+            result: dict[str, Any] | None = None
+            error: str | None = "internal error: incomplete"
             try:
                 result = await body(call)
-            except (InvalidInput, PolicyError, CredentialError) as e:
-                self._finish(event, span, error=str(e))
+                error = None
+            except (
+                InvalidInput,
+                PolicyError,
+                CredentialError,
+                AuditUnavailable,
+                BranchCreationError,
+            ) as e:
+                error = _loggable(e)
                 raise ToolError(str(e)) from None
             except ForgejoError as e:
-                self._finish(event, span, error=str(e))
+                error = str(e)
                 raise ToolError(str(e)) from None
             except httpx.HTTPError as e:
-                msg = f"could not reach Forgejo: {type(e).__name__}"
-                self._finish(event, span, error=msg)
-                raise ToolError(msg) from None
-            except Exception as e:
-                self._finish(event, span, error=f"internal error: {type(e).__name__}")
+                error = f"could not reach an upstream service: {type(e).__name__}"
+                raise ToolError(error) from None
+            except BaseException as e:
+                # Including cancellation: the outcome is recorded either way.
+                error = (
+                    "cancelled"
+                    if isinstance(e, asyncio.CancelledError)
+                    else f"internal error: {type(e).__name__}"
+                )
                 raise
-            for key in ("repo", "branch", "commit", "author", "committer"):
-                if key in event and event[key] is not None:
-                    span.set_attribute(f"alasin.{key}", str(event[key]))
-            self._finish(event, span, result=_result_summary(result))
+            finally:
+                for key in ("repo", "branch", "commit", "author", "committer"):
+                    if event.get(key) is not None:
+                        span.set_attribute(f"alasin.{key}", str(event[key]))
+                summary = _result_summary(result) if result is not None else None
+                self._finish(event, span, result=summary, error=error)
+            assert result is not None
             return result
 
     def _finish(
@@ -234,16 +300,28 @@ class Services:
         result: dict[str, Any] | None = None,
         error: str | None = None,
     ) -> None:
+        """Record the outcome. Never raises: a write may already have landed, and
+        failing the call now would invite a retry that duplicates it. The attempt
+        event written before the write is the fail-closed record."""
+        event = {**event, "phase": "outcome"}
         event["outcome"] = "error" if error else "ok"
         if error:
             event["error"] = error
             if span is not None:
-                from opentelemetry.trace import StatusCode
-
                 span.set_status(StatusCode.ERROR, error)
         if result is not None:
             event["result"] = result
-        self.audit_sink.emit(event)
+        try:
+            self.audit_sink.emit(event)
+        except Exception:
+            log.exception("audit outcome event could not be recorded: %s", event["event_id"])
+
+
+def _loggable(e: BaseException) -> str:
+    """An error message safe for audit and spans: no authorization links or state."""
+    if isinstance(e, AuthorizationRequired):
+        return "Forgejo authorization required (link issued to the caller)"
+    return str(e)
 
 
 def _audit_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -342,9 +420,13 @@ async def resolve_author(
         p = call.principal
         if not p.email:
             raise PolicyError("author_source=token_claims but the token carries no email claim")
+        if not p.email_verified:
+            raise PolicyError("author_source=token_claims needs email_verified=true on the token")
         author = Identity(p.name or p.subject, p.email)
     elif source is AuthorSource.TRUSTED_HEADER and call.request is not None:
         raw = call.request.headers.get(tenant.author_header)
+        if raw and not call.principal.via_gateway:
+            raise PolicyError("the author header is accepted only from the configured gateway")
         if raw:
             author = parse_identity(raw)
             if author is None:
@@ -542,6 +624,18 @@ def build_server(services: Services) -> MCPServer:
                 raise InvalidInput(f"'{p}' is a folder; use list_folder")
             if meta.get("type") != "file":
                 raise InvalidInput(f"'{p}' is a {meta.get('type')}, not a file")
+            size = int(meta.get("size") or 0)
+            if meta.get("content") is None and size > 0:
+                # Forgejo leaves content out for blobs above its API limit.
+                return {
+                    "path": p,
+                    "sha": meta.get("sha"),
+                    "size": size,
+                    "encoding": None,
+                    "truncated": True,
+                    "content": "",
+                    "note": "Forgejo did not return this file's content (too large for its API)",
+                }
             data = base64.b64decode(meta.get("content") or "")
             limit = call.tenant.max_file_bytes
             truncated = len(data) > limit
@@ -592,8 +686,20 @@ def build_server(services: Services) -> MCPServer:
                 budget = MAX_DIFF_CHARS
                 files = cmp.get("files") or []
                 for f in files[:MAX_DIFF_FILES]:
-                    name = f.get("filename")
-                    if not isinstance(name, str):
+                    raw_name = f.get("filename")
+                    try:
+                        # Names come from Forgejo, but they still go into URLs
+                        # made with this tenant's token: validate like any input.
+                        name = validation.file_path(str(raw_name))
+                    except InvalidInput:
+                        diffs.append(
+                            {
+                                "path": str(raw_name)[:200],
+                                "status": f.get("status"),
+                                "diff": None,
+                                "note": "skipped: path not accepted by the server",
+                            }
+                        )
                         continue
                     entry: dict[str, Any] = {"path": name, "status": f.get("status")}
                     if budget <= 0:
@@ -651,8 +757,20 @@ def build_server(services: Services) -> MCPServer:
                 if await client.branch(r, name) is not None:
                     raise PolicyError(f"branch '{name}' already exists")
                 source = validation.ref(from_ref) if from_ref else str(info["default_branch"])
-                created = await client.create_branch(r, name, source)
-            sha = (created.get("commit") or {}).get("id")
+                creator = call.services.branch_creator(call.tenant)
+                call.record_attempt(
+                    "create_branch",
+                    branch=name,
+                    from_ref=source,
+                    method=call.tenant.branch_creation,
+                )
+                assert call.session is not None
+                sha = await creator.create(
+                    BranchRequest(
+                        call.tenant, call.principal, call.session.session_id, r, name, source
+                    ),
+                    client,
+                )
             call.audit["commit"] = sha
             return {"branch": name, "from": source, "commit": sha}
 
@@ -691,6 +809,11 @@ def build_server(services: Services) -> MCPServer:
             total = 0
             for f in files:
                 p = validation.file_path(f.path)
+                if not tenant.allow_ci_paths and is_ci_path(tenant, p):
+                    raise PolicyError(
+                        f"{p}: CI workflow folders ({', '.join(tenant.ci_paths)}) can't be "
+                        "written through this server"
+                    )
                 if p in seen:
                     raise InvalidInput(f"{p} appears twice")
                 seen.add(p)
@@ -732,6 +855,12 @@ def build_server(services: Services) -> MCPServer:
                     raise InvalidInput("no changes: every file already has this content")
                 author, committer, source = await resolve_author(
                     call, client, cred, author_name or None, author_email or None
+                )
+                call.record_attempt(
+                    "commit_files",
+                    branch=name,
+                    author=str(author) if author else None,
+                    committer=str(committer) if committer else None,
                 )
                 result = await client.change_files(
                     r,

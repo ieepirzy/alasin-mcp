@@ -78,10 +78,25 @@ class MemoryAuditSink:
         self.events.append(event)
 
 
+class AuditUnavailable(Exception):
+    """An audit event could not be recorded."""
+
+
 class FanoutAuditSink:
+    """Emit to every sink; if any failed, raise after all have been tried."""
+
     def __init__(self, sinks: list[AuditSink]):
         self._sinks = sinks
 
     def emit(self, event: dict[str, Any]) -> None:
+        errors: list[BaseException] = []
         for s in self._sinks:
-            s.emit(event)
+            try:
+                s.emit(event)
+            except Exception as e:  # noqa: BLE001 - every sink gets its turn
+                errors.append(e)
+        if errors:
+            raise AuditUnavailable(
+                f"{len(errors)} of {len(self._sinks)} audit sinks failed: "
+                + "; ".join(type(e).__name__ for e in errors)
+            ) from errors[0]

@@ -80,14 +80,31 @@ branches the account can't push to. This is defence in depth: Forgejo's branch
 protection and **protected file patterns** are the real gate, and they apply to the
 contents API too (a commit touching a protected path is rejected with 403).
 
+**CI workflow folders.** Files under `.forgejo/`, `.gitea/` and `.github/` (any case)
+are refused by default, because a forge with Actions enabled runs them, with the
+repository's secrets. A tenant can opt in with `allow_ci_paths = true`, or change the
+list with `ci_paths`. Protect these paths in Forgejo as well.
+
+**Request size.** Bodies over `server.max_request_bytes` (default 8 MiB) are refused with
+413 before authentication. Only HTTP is served; WebSocket connections are closed.
+
 **Outbound requests.** Every value placed in a Forgejo URL is validated and
 percent-encoded per segment. The HTTP client never follows redirects, so a token can't
 be carried to another host.
 
-**Audit.** One event per tool call, success or failure: time, tenant, subject, the
-caller's name and email when the token carries them, tool, session ID, trace and span
-IDs, arguments, outcome, result summary, repository, branch, commit, author, committer
-and auth mode. File contents are recorded as size and SHA-256, not copied.
+**Audit.** One outcome event per tool call, success, failure or cancellation: time,
+tenant, subject, the caller's name and email when the token carries them, client
+address, tool, session ID, trace and span IDs, arguments, outcome, result summary,
+repository, branch, commit, author, committer and auth mode. File contents are recorded
+as size and SHA-256, not copied. Authorization links and OAuth `state` never reach audit
+events or span status.
+
+Writes fail closed. Before any mutating Forgejo call (creating a branch, committing) an
+*attempt* event is written; if it can't be recorded, the write isn't made. The outcome
+event is written afterwards whatever happens. If only the outcome can't be recorded, the
+call still returns its result, because the write has landed and an error would invite a
+retry that duplicates it; the attempt event is the record. With several sinks, every
+sink is tried, and a failure in any of them counts as a failure.
 
 ## Auth modes
 
@@ -103,17 +120,25 @@ Chosen per tenant with `auth_mode`.
 `author_source` lets the deployer choose a trusted source for the author; the committer
 stays the service account and the audit records both:
 
-- `token_claims`: `name` and `email` from the verified inbound token (JWT verifier).
-- `trusted_header`: a `Name <email>` header named by `author_header`. Only as trustworthy
-  as your gateway: it must set this header itself and strip any copy sent by clients.
+- `token_claims`: `name` and `email` from the verified inbound token (JWT verifier). The
+  token must carry `email_verified: true`.
+- `trusted_header`: a `Name <email>` header named by `author_header`. It is honoured only
+  from callers that authenticated with an `[[auth.static]]` credential marked
+  `gateway = true`; any other caller sending it is refused, and the config won't load
+  without such a credential. Your gateway must set this header itself and strip any copy
+  sent by clients.
 - `tool_argument`: `author_name` and `author_email` tool arguments. The model controls
   these; use only when that is acceptable. Without this opt-in the arguments are refused.
 
 **User-delegated mode.** When a person has no token yet, tools return a Forgejo
 authorization link. Forgejo redirects to `/oauth/forgejo/callback`; the server exchanges
 the code, then checks that the Forgejo account's `match_field` (default `email`) equals
-the caller's `match_claim`. That check stops a link opened by someone else from binding
-their Forgejo account to your subject. Register an OAuth2 application in Forgejo with
+the caller's `match_claim`. When matching on email, the caller's token must carry
+`email_verified: true` and the address must be a *verified* address of the Forgejo account
+(`GET /user/emails`). That check stops a link opened by someone else from binding their
+Forgejo account to your subject. Refreshes are serialised per person; a refresh that
+Forgejo rejects with `invalid_grant` drops the stored token, while any other failure
+(an outage, for example) keeps it. Register an OAuth2 application in Forgejo with
 the callback URL as its redirect URI. Requires `server.master_key_*`.
 
 **Platform-scoped mode.** Implement `alasin_mcp.credentials.TokenMinter`:
@@ -128,7 +153,26 @@ class TokenMinter(Protocol):
 and name a factory `package.module:factory` (called with the `TenantConfig`) in the
 tenant's `platform.minter`. Without one, calls fail with a clear "no token minter is
 configured" error. Tokens are per repository, so `list_repos` isn't available in this
-mode.
+mode. The author's email must be verified (`email_verified: true`).
+
+## Branch creation
+
+Chosen per tenant with `branch_creation`:
+
+- `api` (default): the server's Forgejo account creates the branch.
+- `webhook`: for setups where another service must create branches. The server sends
+  `POST <branch_webhook.url>` with the JSON body
+  `{"tenant", "repo", "branch", "from_ref", "session_id", "subject"}` and these headers:
+  - `X-Alasin-Timestamp`: Unix seconds.
+  - `X-Alasin-Signature`: `sha256=` followed by the hex HMAC-SHA256 of
+    `"<timestamp>." + body`, keyed with the tenant's webhook secret.
+
+  The secret is re-read on every call. After a 2xx reply the server polls Forgejo until
+  the branch exists, up to `timeout_seconds`. The receiver should verify the signature
+  and reject stale timestamps.
+
+To add another strategy, implement `alasin_mcp.branching.BranchCreator` and register it
+in `Services.branch_creators` under a name tenants can select.
 
 ## Tenant resolver
 
@@ -159,12 +203,11 @@ the tenant from a configured claim).
 `begin_change` mints a work-session ID; every other tool requires it. Sessions expire
 after `server.session_ttl_seconds` (default 12 h).
 
-The server honours `_meta.traceparent` on requests (MCP SEP-414). The trace that
-`begin_change` runs in becomes the work session's trace: if the client sent a
-traceparent, that trace is continued; if not, a new one starts. Later tool spans are
-parented into the session's trace, so one work session is one trace. When a later call
-carries a different incoming trace (some clients send a fresh traceparent per request),
-the span keeps a link to it. The session's trace ID goes into the `Trace-Id` trailer and
+`begin_change` always starts a new trace, which becomes the work session's trace. If the
+client sent `_meta.traceparent` (MCP SEP-414), its trace is recorded as a span link, not
+adopted, so a client can't choose the `Trace-Id` stamped into commits. Later tool spans
+are parented into the session's trace, so one work session is one trace. Incoming traces
+on later calls are linked too. The session's trace ID goes into the `Trace-Id` trailer and
 every audit event.
 
 Spans are exported over OTLP/HTTP when `telemetry.otlp_endpoint` is set; export is off
@@ -186,7 +229,8 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `server.master_key_file` / `_env` | none | Base64 of 32 random bytes (`openssl rand -base64 32`). Required for `user_delegated`. |
 | `server.session_ttl_seconds` | `43200` | Work-session lifetime. |
 | `telemetry.otlp_endpoint` | `""` (off) | OTLP/HTTP traces endpoint. |
-| `[[auth.static]]` | | `token_file`/`token_env`, `tenant`, `subject`. Re-read every 30 s, so rotation needs no restart; list two entries to overlap old and new. The Forgejo service token is re-read on every call. |
+| `server.max_request_bytes` | 8 MiB | Largest request body, checked before authentication. |
+| `[[auth.static]]` | | `token_file`/`token_env`, `tenant`, `subject`, `gateway` (may send the trusted author header). Re-read every 30 s, so rotation needs no restart; list two entries to overlap old and new. The Forgejo service token is re-read on every call. |
 | `[auth.jwt]` | | `jwks_url`, `issuer`, `audience`, `algorithms`, `tenant_claim`, `subject_claim`, `name_claim`, `email_claim`, `default_tenant`. |
 | `[[tenants]] id` | | Lowercase tenant ID. |
 | `forgejo_url` | | Base URL of the tenant's Forgejo. |
@@ -201,6 +245,9 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `max_file_bytes`, `max_commit_files`, `max_commit_bytes` | 1 MB, 50, 5 MB | Read and commit caps. |
 | `[tenants.oauth]` | | `client_id`, `client_secret_file`/`_env`, `redirect_uri`, `match_claim`, `match_field`. |
 | `[tenants.platform]` | | `minter`, `bot_name`, `bot_email`. |
+| `allow_ci_paths`, `ci_paths` | `false`, `.forgejo/`, `.gitea/`, `.github/` | CI workflow folders; see *Security model*. |
+| `branch_creation` | `api` | `api`, `webhook`, or a registered name; see *Branch creation*. |
+| `[tenants.branch_webhook]` | | `url`, `secret_file`/`secret_env`, `timeout_seconds` (60), `poll_interval_seconds` (2). |
 
 ## Running
 

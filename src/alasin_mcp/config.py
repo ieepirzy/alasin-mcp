@@ -18,6 +18,9 @@ from . import validation
 
 DEFAULT_PROTECTED_BRANCHES = ("main", "master", "release/*", "releases/*")
 DEFAULT_COAUTHOR = "Claude <noreply@anthropic.com>"
+# Folders whose files a forge runs as CI. Writing them can run code with the
+# repository's secrets, so they are refused unless a tenant opts in.
+DEFAULT_CI_PATHS = (".forgejo/", ".gitea/", ".github/")
 
 
 class ConfigError(ValueError):
@@ -86,6 +89,16 @@ class PlatformConfig:
 
 
 @dataclass(frozen=True)
+class BranchWebhookConfig:
+    """Where branch-creation requests go when branch_creation = "webhook"."""
+
+    url: str
+    secret: SecretRef
+    timeout_seconds: float = 60.0
+    poll_interval_seconds: float = 2.0
+
+
+@dataclass(frozen=True)
 class TenantConfig:
     id: str
     forgejo_url: str
@@ -102,8 +115,14 @@ class TenantConfig:
     max_file_bytes: int = 1_000_000
     max_commit_files: int = 50
     max_commit_bytes: int = 5_000_000
+    allow_ci_paths: bool = False
+    ci_paths: tuple[str, ...] = DEFAULT_CI_PATHS
     oauth: OAuthAppConfig | None = None
     platform: PlatformConfig | None = None
+    # How branches are created: "api" (default), "webhook", or a name you
+    # registered in Services.branch_creators.
+    branch_creation: str = "api"
+    branch_webhook: BranchWebhookConfig | None = None
 
     @property
     def api_base(self) -> str:
@@ -117,6 +136,9 @@ class StaticCredential:
     token: SecretRef
     tenant: str
     subject: str
+    # The holder is a gateway that sets (and strips from clients) the trusted
+    # author header. Only principals from such entries may supply it.
+    gateway: bool = False
 
 
 @dataclass(frozen=True)
@@ -146,6 +168,9 @@ class ServerConfig:
     master_key: SecretRef = field(default_factory=SecretRef)
     session_ttl_seconds: int = 12 * 3600
     public_url: str = ""
+    # Largest request body accepted, checked before authentication. Leave room
+    # for base64: a commit of max_commit_bytes is about 4/3 of that on the wire.
+    max_request_bytes: int = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -199,6 +224,25 @@ def _tenant(raw: dict[str, Any]) -> TenantConfig:
             bot_name=str(p.get("bot_name", "")),
             bot_email=str(p.get("bot_email", "")),
         )
+    webhook = None
+    if "branch_webhook" in raw:
+        w = raw["branch_webhook"]
+        hook_url = str(w["url"])
+        if not hook_url.startswith(("https://", "http://")):
+            raise ConfigError(f"tenant {tid}: branch_webhook.url must be an http(s) URL")
+        webhook = BranchWebhookConfig(
+            url=hook_url,
+            secret=_secret(w, "secret"),
+            timeout_seconds=float(w.get("timeout_seconds", 60)),
+            poll_interval_seconds=float(w.get("poll_interval_seconds", 2)),
+        )
+        if not webhook.secret.configured:
+            raise ConfigError(f"tenant {tid}: branch_webhook needs secret_file or secret_env")
+        if not 0 < webhook.timeout_seconds <= 600 or webhook.poll_interval_seconds <= 0:
+            raise ConfigError(f"tenant {tid}: branch_webhook timing out of range")
+    creation = str(raw.get("branch_creation", "api"))
+    if creation == "webhook" and webhook is None:
+        raise ConfigError(f"tenant {tid}: branch_creation=webhook needs [tenants.branch_webhook]")
     tenant = TenantConfig(
         id=tid,
         forgejo_url=url,
@@ -214,8 +258,12 @@ def _tenant(raw: dict[str, Any]) -> TenantConfig:
         max_file_bytes=int(raw.get("max_file_bytes", 1_000_000)),
         max_commit_files=int(raw.get("max_commit_files", 50)),
         max_commit_bytes=int(raw.get("max_commit_bytes", 5_000_000)),
+        allow_ci_paths=bool(raw.get("allow_ci_paths", False)),
+        ci_paths=tuple(raw.get("ci_paths", DEFAULT_CI_PATHS)),
         oauth=oauth,
         platform=platform,
+        branch_creation=creation,
+        branch_webhook=webhook,
     )
     if mode is AuthMode.SERVICE_ACCOUNT and not tenant.service_token.configured:
         raise ConfigError(f"tenant {tid}: service_account mode needs service_token_file/_env")
@@ -236,6 +284,7 @@ def parse(raw: dict[str, Any]) -> Config:
         master_key=_secret(s, "master_key"),
         session_ttl_seconds=int(s.get("session_ttl_seconds", ServerConfig.session_ttl_seconds)),
         public_url=str(s.get("public_url", "")).rstrip("/"),
+        max_request_bytes=int(s.get("max_request_bytes", ServerConfig.max_request_bytes)),
     )
     t = raw.get("telemetry", {})
     telemetry = TelemetryConfig(
@@ -254,6 +303,7 @@ def parse(raw: dict[str, Any]) -> Config:
             token=_secret(c, "token"),
             tenant=validation.tenant_id(str(c["tenant"])),
             subject=str(c["subject"]),
+            gateway=bool(c.get("gateway", False)),
         )
         for c in auth.get("static", ())
     )
@@ -276,6 +326,14 @@ def parse(raw: dict[str, Any]) -> Config:
     for c in statics:
         if c.tenant not in ids:
             raise ConfigError(f"static credential for unknown tenant {c.tenant!r}")
+    for t in tenants:
+        if t.author_source is AuthorSource.TRUSTED_HEADER and not any(
+            c.gateway and c.tenant == t.id for c in statics
+        ):
+            raise ConfigError(
+                f"tenant {t.id}: author_source=trusted_header needs an [[auth.static]] entry "
+                "with gateway = true for this tenant"
+            )
     needs_key = any(x.auth_mode is AuthMode.USER_DELEGATED for x in tenants)
     if needs_key and not server.master_key.configured:
         raise ConfigError("user_delegated mode stores tokens: set server.master_key_file/_env")

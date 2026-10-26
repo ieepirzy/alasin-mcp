@@ -23,6 +23,8 @@ service_name = "alasin-mcp"
 token_file = "/run/secrets/alasin_client_token"
 tenant = "default"
 subject = "gateway"
+# This credential belongs to a gateway that sets the trusted author header.
+gateway = true
 
 # Or verify JWTs from an identity provider instead (or as well):
 # [auth.jwt]
@@ -45,3 +47,12 @@ branch_prefix = ""
 author_source = "service_account"
 agent_coauthor = "Claude <noreply@anthropic.com>"
 rate_limit_per_minute = 120
+# CI workflow folders (.forgejo/, .gitea/, .github/) are refused unless:
+# allow_ci_paths = true
+
+# Branch creation: "api" (default), or "webhook" when another service creates them.
+# branch_creation = "webhook"
+# [tenants.branch_webhook]
+# url = "https://branches.example.com/create"
+# secret_file = "/run/secrets/alasin_branch_webhook"
+# timeout_seconds = 60

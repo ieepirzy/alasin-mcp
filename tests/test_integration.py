@@ -80,7 +80,7 @@ def server(
     )
     verifier = StaticPrincipalVerifier(
         {
-            "tok-a": Principal("a", "gateway", "Jane Doe", "jane@example.com"),
+            "tok-a": Principal("a", "gateway", "Jane Doe", "jane@example.com", email_verified=True),
             "tok-b": Principal("b", "gateway"),
         }
     )
@@ -105,8 +105,13 @@ async def test_full_change_flow(forgejo, monkeypatch, spans) -> None:
     with server(forgejo, monkeypatch) as (url, rec, audit):
         s = await ok(url, "begin_change", {"intent": "new copy"}, meta={"traceparent": TRACEPARENT})
         sid = s["session_id"]
-        # The client's traceparent is honoured: the session's trace is the client's.
-        assert s["trace_id"] == "0af7651916cd43dd8448eb211c80319c"
+        # The session's trace is minted by the server; the client's traceparent
+        # is linked, not adopted, so a client can't choose the Trace-Id trailer.
+        client_trace = "0af7651916cd43dd8448eb211c80319c"
+        assert s["trace_id"] != client_trace
+        begin = [x for x in spans.get_finished_spans() if x.name == "alasin.begin_change"]
+        assert begin[-1].parent is None
+        assert [format(link.context.trace_id, "032x") for link in begin[-1].links] == [client_trace]
         repos = await ok(url, "list_repos", {"session_id": sid})
         assert [r["repo"] for r in repos["repos"]] == ["acme/site"]  # acme/other not allowlisted
         base = {"session_id": sid, "repo": "acme/site"}
@@ -166,7 +171,7 @@ async def test_full_change_flow(forgejo, monkeypatch, spans) -> None:
     assert rec.seen and all(
         h == f"127.0.0.1:{forgejo.port}" and t == forgejo.bot_token for h, _, t in rec.seen
     )
-    events = [e for e in audit.events if e["tool"] == "commit_files" and e["outcome"] == "ok"]
+    events = [e for e in audit.events if e["tool"] == "commit_files" and e.get("outcome") == "ok"]
     assert events[0]["commit"] == c["commit"]
     assert events[0]["branch"] == "lane/copy" and events[0]["repo"] == "acme/site"
     assert events[0]["trace_id"] == s["trace_id"]
@@ -284,3 +289,22 @@ async def test_tenant_a_cannot_reach_tenant_b_on_a_real_instance(forgejo, monkey
     assert all(h == f"127.0.0.1:{forgejo.port}" for h, _, _ in a_side)
     assert all(h == f"localhost:{forgejo.port}" for h, _, _ in b_side)
     assert not any("private" in p for _, p, _ in a_side)
+
+
+async def test_ci_workflow_paths_refused_on_a_real_instance(forgejo, monkeypatch) -> None:
+    with server(forgejo, monkeypatch) as (url, rec, _):
+        sid = (await ok(url, "begin_change", {}))["session_id"]
+        base = {"session_id": sid, "repo": "acme/site"}
+        await ok(url, "create_branch", {**base, "branch": "lane/ci"})
+        text = await err(
+            url,
+            "commit_files",
+            {
+                **base,
+                "branch": "lane/ci",
+                "message": "add a workflow",
+                "files": [{"path": ".forgejo/workflows/x.yml", "content": "on: push\n"}],
+            },
+        )
+        assert "CI workflow" in text
+        assert not [p for m, p in rec.methods if m == "POST" and p.endswith("/contents")]

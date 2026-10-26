@@ -60,6 +60,7 @@ def build_app(
     verifier: TokenVerifier,
     allowed_hosts: tuple[str, ...] = (),
     delegated: UserDelegatedProvider | None = None,
+    max_request_bytes: int = 8 * 1024 * 1024,
 ) -> Starlette:
     server = build_server(services)
     security = TransportSecuritySettings(
@@ -72,6 +73,7 @@ def build_app(
         stateless_http=True,
         json_response=True,
         transport_security=security,
+        max_request_body_size=max_request_bytes,
         host="0.0.0.0",  # noqa: S104 - binding is decided by uvicorn, not here
     )
     app.router.routes.append(Route("/healthz", _health))
@@ -96,6 +98,7 @@ def build_app(
         BearerAuthMiddleware,
         verifier=verifier,
         public_paths=("/healthz", CALLBACK_PATH),
+        max_body_bytes=max_request_bytes,
     )
     return app
 
@@ -140,7 +143,13 @@ def from_config(
         audit_sink=sink,
         session_ttl=cfg.server.session_ttl_seconds,
     )
-    return build_app(services, ChainVerifier(verifiers), cfg.server.allowed_hosts, delegated)
+    return build_app(
+        services,
+        ChainVerifier(verifiers),
+        cfg.server.allowed_hosts,
+        delegated,
+        cfg.server.max_request_bytes,
+    )
 
 
 def main() -> None:

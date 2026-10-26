@@ -77,6 +77,10 @@ def branch(value: str) -> str:
         or "/." in value
         or "@{" in value
         or value == "HEAD"
+        # After one refs/heads/ strip, anything still ref-shaped (refs/heads/main,
+        # heads/main, refs/tags/x) would create a branch that reads like another ref.
+        or value.startswith(("refs/", "heads/", "tags/", "remotes/"))
+        or value in ("refs", "heads", "tags", "remotes")
     )
     if bad:
         raise InvalidInput(f"invalid branch name {value!r}")
@@ -107,7 +111,7 @@ def file_path(value: str, *, allow_root: bool = False) -> str:
         raise InvalidInput(f"invalid path {value!r}")
     segments = stripped.split("/")
     for seg in segments:
-        if seg in ("", ".", "..") or seg == ".git":
+        if seg in ("", ".", "..") or seg.casefold() == ".git":
             raise InvalidInput(f"invalid path {value!r}")
     return stripped
 

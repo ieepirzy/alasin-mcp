@@ -5,12 +5,11 @@ An SDK tracer provider is always installed, so trace IDs are real even when
 nothing is exported: they still go into commit trailers and audit events.
 Spans are exported over OTLP/HTTP only when an endpoint is configured.
 
-Trace shape: the MCP SDK opens a span per request, continuing the client's
-``_meta.traceparent`` when one is sent (SEP-414). ``begin_change`` records the
-trace it ran in on the work session. Later tool spans are parented to that
-trace, so one work session is one trace. When a later call arrives with a
-different incoming trace (some clients send a fresh traceparent per request),
-the tool span links to it instead.
+Trace shape: ``begin_change`` always starts a new trace and records it on the
+work session; a client's ``_meta.traceparent`` (SEP-414) is kept as a span
+link, so a client can't choose the Trace-Id stamped into commits. Later tool
+spans are parented into the session's trace, so one work session is one
+trace; an incoming trace on those calls is linked too.
 """
 
 from __future__ import annotations
@@ -85,12 +84,13 @@ def tool_span(
     session_trace: tuple[str, str] | None,
     attributes: dict[str, Any],
     meta: Mapping[str, Any] | None = None,
+    new_root: bool = False,
 ) -> Iterator[Span]:
     """A span for one tool call.
 
-    Parent, in order: the work session's trace; else the client's incoming
-    traceparent; else whatever span is current. An incoming trace that differs
-    from the session's is kept as a link.
+    Parent, in order: the work session's trace; for ``new_root`` (begin_change)
+    no parent at all; else the client's incoming traceparent; else whatever span
+    is current. An incoming trace that isn't the parent is kept as a link.
     """
     incoming = incoming_context(meta)
     current = trace.get_current_span().get_span_context()
@@ -105,9 +105,22 @@ def tool_span(
             context = _remote(trace_id, span_id)
             if upstream is not None:
                 links.append(Link(upstream))
+    elif new_root:
+        # A work session's trace is always minted here, so a client can't choose
+        # the Trace-Id that goes into commits. Its own trace is kept as a link.
+        context = Context()
+        if upstream is not None:
+            links.append(Link(upstream))
     elif upstream is not None:
         context = trace.set_span_in_context(NonRecordingSpan(upstream))
+    # Exceptions are not recorded here: the caller sets a sanitised status, and
+    # an exception's text (for example an authorization link) must not leak.
     with tracer().start_as_current_span(
-        f"alasin.{name}", context=context, links=links, attributes=attributes
+        f"alasin.{name}",
+        context=context,
+        links=links,
+        attributes=attributes,
+        record_exception=False,
+        set_status_on_exception=False,
     ) as span:
         yield span

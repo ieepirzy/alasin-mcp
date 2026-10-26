@@ -45,6 +45,11 @@ class Principal:
     name: str | None = None
     email: str | None = None
     claims: Mapping[str, Any] = field(default_factory=dict)
+    # Verified through a static credential marked gateway = true: the only
+    # callers whose trusted author header is honoured.
+    via_gateway: bool = False
+    # The identity provider asserted the email is verified (email_verified).
+    email_verified: bool = False
 
     @property
     def key(self) -> tuple[str, str]:
@@ -73,12 +78,12 @@ class StaticTokenVerifier:
         reload_seconds: float = 30.0,
     ):
         self._fixed = [
-            (hashlib.sha256(tok.encode()).digest(), validation.tenant_id(tenant), subject)
+            (hashlib.sha256(tok.encode()).digest(), validation.tenant_id(tenant), subject, False)
             for tok, tenant, subject in credentials or []
         ]
         self._refs = refs
         self._reload = reload_seconds
-        self._loaded: list[tuple[bytes, str, str]] = []
+        self._loaded: list[tuple[bytes, str, str, bool]] = []
         self._loaded_at = float("-inf")
         if refs:
             self._load()
@@ -96,7 +101,8 @@ class StaticTokenVerifier:
                 # A credential mid-rotation (file briefly missing) is skipped,
                 # not fatal; the others keep working.
                 continue
-            loaded.append((hashlib.sha256(token.encode()).digest(), c.tenant, c.subject))
+            digest = hashlib.sha256(token.encode()).digest()
+            loaded.append((digest, c.tenant, c.subject, c.gateway))
         self._loaded = loaded
         self._loaded_at = time.monotonic()
 
@@ -105,10 +111,10 @@ class StaticTokenVerifier:
             self._load()
         digest = hashlib.sha256(token.encode()).digest()
         found: Principal | None = None
-        for expected, tenant, subject in self._fixed + self._loaded:
+        for expected, tenant, subject, gateway in self._fixed + self._loaded:
             # No early exit, so timing does not reveal which entry matched.
             if hmac.compare_digest(digest, expected):
-                found = Principal(tenant=tenant, subject=subject)
+                found = Principal(tenant=tenant, subject=subject, via_gateway=gateway)
         return found
 
 
@@ -150,6 +156,7 @@ class JwtVerifier:
             name=name if isinstance(name, str) else None,
             email=email if isinstance(email, str) else None,
             claims=claims,
+            email_verified=claims.get("email_verified") is True,
         )
 
 
@@ -180,15 +187,26 @@ class BearerAuthMiddleware:
         verifier: TokenVerifier,
         public_paths: tuple[str, ...] = ("/healthz",),
         public_prefixes: tuple[str, ...] = (),
+        max_body_bytes: int = 8 * 1024 * 1024,
     ):
         self.app = app
         self.verifier = verifier
         self.public_paths = public_paths
         self.public_prefixes = public_prefixes
+        self.max_body_bytes = max_body_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        if scope["type"] == "lifespan":
             await self.app(scope, receive, send)
+            return
+        if scope["type"] != "http":
+            # WebSockets and anything else: this server speaks plain HTTP only.
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+            return
+        length = _content_length(scope)
+        if length is not None and length > self.max_body_bytes:
+            await _error(send, 413, "request_too_large")
             return
         # Never trust a principal that something upstream put in the scope.
         scope.pop(PRINCIPAL_SCOPE_KEY, None)
@@ -216,16 +234,34 @@ def _bearer(scope: Scope) -> str | None:
     return None
 
 
+def _content_length(scope: Scope) -> int | None:
+    for name, value in scope.get("headers", ()):
+        if name == b"content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
 async def _unauthorized(send: Send) -> None:
-    body = json.dumps({"error": "invalid_token"}).encode()
+    await _error(
+        send, 401, "invalid_token", [(b"www-authenticate", b'Bearer error="invalid_token"')]
+    )
+
+
+async def _error(
+    send: Send, status: int, error: str, extra: list[tuple[bytes, bytes]] | None = None
+) -> None:
+    body = json.dumps({"error": error}).encode()
     await send(
         {
             "type": "http.response.start",
-            "status": 401,
+            "status": status,
             "headers": [
                 (b"content-type", b"application/json"),
-                (b"www-authenticate", b'Bearer error="invalid_token"'),
                 (b"content-length", str(len(body)).encode()),
+                *(extra or []),
             ],
         }
     )

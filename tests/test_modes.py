@@ -55,8 +55,11 @@ def _tenant(**kw: Any) -> TenantConfig:
 
 
 class FakeOAuth:
-    def __init__(self, email: str = "alice@example.com", expires_in: int = 3600):
+    def __init__(
+        self, email: str = "alice@example.com", expires_in: int = 3600, verified: bool = True
+    ):
         self.email = email
+        self.verified = verified
         self.expires_in = expires_in
         self.posts: list[dict[str, list[str]]] = []
 
@@ -72,6 +75,10 @@ class FakeOAuth:
                     "refresh_token": f"refresh-{n}",
                     "expires_in": self.expires_in,
                 },
+            )
+        if request.url.path == "/api/v1/user/emails":
+            return httpx.Response(
+                200, json=[{"email": self.email, "verified": self.verified, "primary": True}]
             )
         if request.url.path == "/api/v1/user":
             return httpx.Response(200, json={"login": "alice", "email": self.email})
@@ -90,7 +97,7 @@ def _provider(fake: FakeOAuth) -> tuple[UserDelegatedProvider, Store, TenantConf
     return p, store, tenant
 
 
-ALICE = Principal("t1", "alice-sub", "Alice", "alice@example.com")
+ALICE = Principal("t1", "alice-sub", "Alice", "alice@example.com", email_verified=True)
 
 
 async def test_delegated_flow_binds_token_to_tenant_and_subject() -> None:
@@ -109,7 +116,9 @@ async def test_delegated_flow_binds_token_to_tenant_and_subject() -> None:
     assert store.get_token("t1", "alice-sub") is not None
     # Another subject, or the same subject in another tenant, has nothing.
     with pytest.raises(AuthorizationRequired):
-        await p.credential(tenant, Principal("t1", "bob", None, "bob@example.com"), None)
+        await p.credential(
+            tenant, Principal("t1", "bob", None, "bob@example.com", email_verified=True), None
+        )
     assert store.get_token("t2", "alice-sub") is None
 
 

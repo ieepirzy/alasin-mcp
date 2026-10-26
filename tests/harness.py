@@ -122,6 +122,8 @@ class FakeRepo:
     branches: dict[str, dict[str, bytes]] = field(default_factory=dict)
     protected: set[str] = field(default_factory=set)
     commits: list[dict[str, Any]] = field(default_factory=list)
+    compare: dict[str, Any] | None = None
+    null_content: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -224,6 +226,7 @@ class FakeForgejo:
             p = "/".join(rest[1:])
             if p in files:
                 data = files[p]
+                content = None if p in repo.null_content else base64.b64encode(data).decode()
                 return httpx.Response(
                     200,
                     json={
@@ -232,7 +235,7 @@ class FakeForgejo:
                         "name": p.rsplit("/", 1)[-1],
                         "sha": f"sha-{p}",
                         "size": len(data),
-                        "content": base64.b64encode(data).decode(),
+                        "content": content,
                     },
                 )
             children = [k for k in files if k.startswith(p + "/") or not p]
@@ -249,5 +252,32 @@ class FakeForgejo:
                 return httpx.Response(200, content=files[p])
             return httpx.Response(404, json={"message": "not found"})
         if rest[0] == "compare":
-            return httpx.Response(200, json={"commits": [], "files": [], "total_commits": 0})
+            return httpx.Response(
+                200, json=repo.compare or {"commits": [], "files": [], "total_commits": 0}
+            )
         return httpx.Response(404, json={"message": "unhandled"})
+
+
+def fake_services(
+    fake: FakeForgejo, tenants: list[TenantConfig], sink: Any = None, **kw: Any
+) -> Any:
+    """Services over a FakeForgejo, service-account mode, in-memory store."""
+    import os
+
+    from alasin_mcp.audit import MemoryAuditSink
+    from alasin_mcp.config import AuthMode
+    from alasin_mcp.credentials import ModeRouter, ServiceAccountProvider
+    from alasin_mcp.store import LocalKeyWrapper, Store
+    from alasin_mcp.tenancy import StaticTenantResolver
+    from alasin_mcp.tools import Services
+
+    return Services(
+        resolver=StaticTenantResolver(tenants),
+        credentials=kw.pop(
+            "credentials", ModeRouter({AuthMode.SERVICE_ACCOUNT: ServiceAccountProvider()})
+        ),
+        store=Store(":memory:", LocalKeyWrapper(os.urandom(32))),
+        audit_sink=sink if sink is not None else MemoryAuditSink(),
+        transport=fake.transport(),
+        **kw,
+    )

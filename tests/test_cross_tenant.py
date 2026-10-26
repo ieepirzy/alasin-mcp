@@ -280,7 +280,11 @@ def delegated_world(monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
             from alasin_mcp.auth import Principal
 
             t = {A_CLIENT: "tenant-a", B_CLIENT: "tenant-b"}.get(token)
-            return Principal(t, "gateway", None, "same@example.com") if t else None
+            return (
+                Principal(t, "gateway", None, "same@example.com", email_verified=True)
+                if t
+                else None
+            )
 
     with serve(build_app(services, WithEmail())) as url:
         yield World(url, fake, services, services.audit_sink)  # type: ignore[arg-type]
