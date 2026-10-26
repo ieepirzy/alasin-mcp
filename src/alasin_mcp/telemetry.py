@@ -15,11 +15,12 @@ the tool span links to it instead.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
-from opentelemetry import trace
+from opentelemetry import propagate, trace
+from opentelemetry.context import Context
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -56,26 +57,56 @@ def ids(span: Span) -> tuple[str, str]:
     return format(ctx.trace_id, "032x"), format(ctx.span_id, "016x")
 
 
+def incoming_context(meta: Mapping[str, Any] | None) -> SpanContext | None:
+    """The client's span context from ``_meta.traceparent`` (SEP-414), if valid."""
+    if not meta or not isinstance(meta.get("traceparent"), str):
+        return None
+    try:
+        ctx = propagate.extract({k: v for k, v in meta.items() if isinstance(v, str)})
+    except (ValueError, TypeError):
+        return None
+    span_ctx = trace.get_current_span(ctx).get_span_context()
+    return span_ctx if span_ctx.is_valid else None
+
+
+def _remote(trace_id: int, span_id: int) -> Context:
+    parent = SpanContext(
+        trace_id=trace_id,
+        span_id=span_id,
+        is_remote=True,
+        trace_flags=TraceFlags(TraceFlags.SAMPLED),
+    )
+    return trace.set_span_in_context(NonRecordingSpan(parent))
+
+
 @contextmanager
 def tool_span(
-    name: str, session_trace: tuple[str, str] | None, attributes: dict[str, Any]
+    name: str,
+    session_trace: tuple[str, str] | None,
+    attributes: dict[str, Any],
+    meta: Mapping[str, Any] | None = None,
 ) -> Iterator[Span]:
-    """A span for one tool call, in the work session's trace when there is one."""
+    """A span for one tool call.
+
+    Parent, in order: the work session's trace; else the client's incoming
+    traceparent; else whatever span is current. An incoming trace that differs
+    from the session's is kept as a link.
+    """
+    incoming = incoming_context(meta)
     current = trace.get_current_span().get_span_context()
-    context = None
+    upstream = incoming or (current if current.is_valid else None)
+    context: Context | None = None
     links: list[Link] = []
     if session_trace is not None:
         trace_id, span_id = int(session_trace[0], 16), int(session_trace[1], 16)
-        if not (current.is_valid and current.trace_id == trace_id):
-            parent = SpanContext(
-                trace_id=trace_id,
-                span_id=span_id,
-                is_remote=True,
-                trace_flags=TraceFlags(TraceFlags.SAMPLED),
-            )
-            context = trace.set_span_in_context(NonRecordingSpan(parent))
-            if current.is_valid:
-                links.append(Link(current))
+        if upstream is not None and upstream.trace_id == trace_id:
+            context = trace.set_span_in_context(NonRecordingSpan(upstream))
+        else:
+            context = _remote(trace_id, span_id)
+            if upstream is not None:
+                links.append(Link(upstream))
+    elif upstream is not None:
+        context = trace.set_span_in_context(NonRecordingSpan(upstream))
     with tracer().start_as_current_span(
         f"alasin.{name}", context=context, links=links, attributes=attributes
     ) as span:

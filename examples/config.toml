@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+# alasin-mcp: one tenant, service-account mode, behind an OAuth gateway.
+# Secrets are never written here: each is referenced by *_file or *_env.
+
+[server]
+port = 8000
+# The Host header your gateway uses to reach this server (DNS-rebinding check).
+allowed_hosts = ["alasin.internal.example.com"]
+forwarded_allow_ips = "127.0.0.1"
+state_path = "/var/lib/alasin/state.db"
+audit_dir = "/var/lib/alasin/audit"
+session_ttl_seconds = 43200
+# Needed only for user_delegated tenants (32 random bytes, base64):
+# master_key_file = "/run/secrets/alasin_master_key"
+
+[telemetry]
+# Off by default. Set to export spans over OTLP/HTTP:
+# otlp_endpoint = "http://otel-collector.example.com:4318/v1/traces"
+service_name = "alasin-mcp"
+
+# The credential your gateway sends as "Authorization: Bearer ...".
+[[auth.static]]
+token_file = "/run/secrets/alasin_client_token"
+tenant = "default"
+subject = "gateway"
+
+# Or verify JWTs from an identity provider instead (or as well):
+# [auth.jwt]
+# jwks_url = "https://idp.example.com/realms/example/protocol/openid-connect/certs"
+# issuer = "https://idp.example.com/realms/example"
+# audience = "alasin-mcp"
+# tenant_claim = "tenant"
+
+[[tenants]]
+id = "default"
+forgejo_url = "https://forgejo.example.com"
+auth_mode = "service_account"
+service_token_file = "/run/secrets/alasin_forgejo_token"
+# owner/name globs this tenant may reach. Empty means none.
+repos = ["example-org/website"]
+protected_branches = ["main", "master", "release/*"]
+branch_prefix = ""
+# Who authors commits in service_account mode:
+#   service_account (default) | token_claims | trusted_header | tool_argument
+author_source = "service_account"
+agent_coauthor = "Claude <noreply@anthropic.com>"
+rate_limit_per_minute = 120

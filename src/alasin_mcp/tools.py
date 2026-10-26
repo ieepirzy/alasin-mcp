@@ -199,7 +199,8 @@ class Services:
             "alasin.tool": tool,
             "alasin.session_id": session_id or "",
         }
-        with telemetry.tool_span(tool, session_trace, attrs) as span:
+        meta = ctx.request_context.meta
+        with telemetry.tool_span(tool, session_trace, attrs, meta) as span:
             trace_id, span_id = telemetry.ids(span)
             event["trace_id"] = session.trace_id if session else trace_id
             event["span_id"] = span_id
@@ -299,9 +300,12 @@ async def check_writable(
             raise PolicyError(f"branch '{branch}' is protected by server policy ({pattern})")
     if tenant.branch_prefix and not branch.startswith(tenant.branch_prefix):
         raise PolicyError(f"branch names must start with '{tenant.branch_prefix}'")
+    # Forgejo marks every branch a protection rule matches as "protected",
+    # including work branches where pushing is allowed and only some file
+    # patterns are locked. What matters is whether this account may push.
     existing = await client.branch(repo, branch)
-    if existing is not None and existing.get("protected"):
-        raise PolicyError(f"branch '{branch}' is protected in Forgejo")
+    if existing is not None and existing.get("user_can_push") is False:
+        raise PolicyError(f"branch '{branch}' is protected in Forgejo (no push allowed)")
 
 
 def parse_identity(value: str) -> Identity | None:
