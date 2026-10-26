@@ -1,0 +1,70 @@
+[project]
+name = "alasin-mcp"
+version = "0.1.0"
+description = "A remote, multi-tenant MCP server that gives AI agents branch-and-commit access to Forgejo or Gitea"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.13"
+# Pinned exactly: the server holds a privileged Forgejo credential, so a
+# dependency upgrade is a deliberate, reviewed change (uv.lock pins the rest).
+dependencies = [
+    "mcp==2.3.0",
+    "httpx==0.28.1",
+    "uvicorn==0.54.0",
+    "starlette==1.8.0",
+    "pyjwt[crypto]==2.15.1",
+    "cryptography==50.0.2",
+    "opentelemetry-api==1.45.1",
+    "opentelemetry-sdk==1.45.1",
+    "opentelemetry-exporter-otlp-proto-http==1.45.1",
+]
+
+[project.scripts]
+alasin-mcp = "alasin_mcp.app:main"
+
+[project.urls]
+Source = "https://github.com/ieepirzy/alasin-mcp"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alasin_mcp"]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-timeout==2.4.0",
+    "ruff==0.17.0",
+    "pyright==1.1.414",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+# Every test fails bounded: a hung Forgejo or a stuck event loop fails the
+# test after this many seconds instead of holding the run.
+timeout = 60
+markers = ["forgejo: needs the Forgejo container (tests/forgejo.py)"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "S"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/**" = ["S603", "S607"]
+"tests/**" = ["S105", "S106", "S107", "S603", "S607", "S108"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["alasin_mcp"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"

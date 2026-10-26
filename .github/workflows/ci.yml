@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: Apache-2.0
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      # A missing Docker must fail the integration tests here, not skip them.
+      ALASIN_REQUIRE_FORGEJO: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.0"
+      - run: uv sync --locked --python 3.13
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pyright
+      - run: uv run python scripts/check_spdx.py
+      - name: Pull the pinned Forgejo image
+        run: timeout 300 docker pull "$(uv run python -c 'from tests.forgejo import IMAGE; print(IMAGE)')"
+      - name: Tests (unit, isolation, and integration against Forgejo)
+        run: |
+          set -o pipefail
+          timeout 900 uv run pytest -q -rs 2>&1 | tee pytest.log
+          # The integration tests must have run, not been skipped.
+          if grep -qE "[0-9]+ skipped" pytest.log; then echo "::error::tests were skipped"; exit 1; fi
+
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build
+        run: timeout 600 docker build -t alasin-mcp:ci .
+      - name: The image starts and serves /healthz
+        run: |
+          mkdir -p ci && printf 'client-secret\n' > ci/client && printf 'forgejo-token\n' > ci/forgejo
+          cat > ci/config.toml <<'TOML'
+          [server]
+          state_path = "/tmp/alasin/state.db"
+          audit_dir = "/tmp/alasin/audit"
+          [[auth.static]]
+          token_file = "/ci/client"
+          tenant = "default"
+          subject = "ci"
+          [[tenants]]
+          id = "default"
+          forgejo_url = "https://forgejo.example.com"
+          service_token_file = "/ci/forgejo"
+          repos = ["example-org/*"]
+          TOML
+          docker run -d --name alasin -p 127.0.0.1:8000:8000 -v "$PWD/ci:/ci:ro" \
+            -e ALASIN_CONFIG=/ci/config.toml alasin-mcp:ci
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8000/healthz && break; sleep 1; done
+          curl -sf http://127.0.0.1:8000/healthz
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/mcp)
+          test "$code" = "401" || { docker logs alasin; echo "::error::/mcp without a token gave $code"; exit 1; }
