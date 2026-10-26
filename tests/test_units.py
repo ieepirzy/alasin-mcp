@@ -267,3 +267,30 @@ def test_example_config_parses() -> None:
     here = os.path.dirname(__file__)
     cfg = load(os.path.join(here, "..", "examples", "config.toml"))
     assert cfg.tenants[0].id == "default"
+
+
+# -- static credential rotation ----------------------------------------------------------------
+
+
+async def _verify(v, token):  # type: ignore[no-untyped-def]
+    return await v.verify(token)
+
+
+def test_static_credential_rotates_without_restart(tmp_path) -> None:
+    import anyio
+
+    from alasin_mcp.auth import StaticTokenVerifier
+    from alasin_mcp.config import SecretRef, StaticCredential
+
+    f = tmp_path / "client"
+    f.write_text("old-secret\n")
+    v = StaticTokenVerifier.from_config(
+        (StaticCredential(SecretRef(file=str(f)), "default", "gateway"),)
+    )
+    assert anyio.run(_verify, v, "old-secret") is not None
+    f.write_text("new-secret\n")
+    v._reload = 0.0
+    assert anyio.run(_verify, v, "new-secret") is not None
+    assert anyio.run(_verify, v, "old-secret") is None
+    f.unlink()
+    assert anyio.run(_verify, v, "new-secret") is None

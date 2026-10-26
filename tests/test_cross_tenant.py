@@ -233,3 +233,79 @@ async def test_spoofed_principal_headers_are_ignored(world: World) -> None:
     assert r.data is not None
     assert [x["repo"] for x in r.data["repos"]] == ["acme/site"]
     world.assert_no_b_traffic()
+
+
+# -- stored tokens (user-delegated mode) ----------------------------------------------------
+
+B_STORED = "b-delegated-access-token"
+
+
+@pytest.fixture
+def delegated_world(monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
+    from alasin_mcp.config import OAuthAppConfig, SecretRef
+    from alasin_mcp.credentials import UserDelegatedProvider
+
+    monkeypatch.setenv("TEST_OAUTH_SECRET", "s")
+    fake = FakeForgejo()
+    fake.add_host(A_HOST, "a-delegated", "alice", {"acme/site": _repo()})
+    fake.add_host(B_HOST, B_STORED, "bob", {"beta/secret": _repo()})
+
+    def oauth(host: str) -> OAuthAppConfig:
+        return OAuthAppConfig(
+            client_id="cid",
+            client_secret=SecretRef(env="TEST_OAUTH_SECRET"),
+            redirect_uri=f"https://{host}/cb",
+        )
+
+    tenants = [
+        tenant("tenant-a", f"https://{A_HOST}", "UNUSED", auth_mode=AuthMode.USER_DELEGATED,
+               oauth=oauth(A_HOST)),
+        tenant("tenant-b", f"https://{B_HOST}", "UNUSED", auth_mode=AuthMode.USER_DELEGATED,
+               oauth=oauth(B_HOST)),
+    ]  # fmt: skip
+    store = Store(":memory:", LocalKeyWrapper(os.urandom(32)))
+    # B's principal has a token; A's principal uses the very same subject string.
+    store.put_token("tenant-b", "gateway", {"access_token": B_STORED, "expires_at": 0})
+    provider = UserDelegatedProvider(store, {t.id: t for t in tenants}.__getitem__)
+    services = Services(
+        resolver=StaticTenantResolver(tenants),
+        credentials=ModeRouter({AuthMode.USER_DELEGATED: provider}),
+        store=store,
+        audit_sink=MemoryAuditSink(),
+        transport=fake.transport(),
+    )
+
+    class WithEmail:
+        async def verify(self, token: str):
+            from alasin_mcp.auth import Principal
+
+            t = {A_CLIENT: "tenant-a", B_CLIENT: "tenant-b"}.get(token)
+            return Principal(t, "gateway", None, "same@example.com") if t else None
+
+    with serve(build_app(services, WithEmail())) as url:
+        yield World(url, fake, services, services.audit_sink)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("tool", [t for t in TOOL_NAMES if t != "begin_change"])
+async def test_tenant_a_never_uses_tenant_bs_stored_token(
+    delegated_world: World, tool: str
+) -> None:
+    w = delegated_world
+    sid = await _session(w.url, A_CLIENT)
+    r = await call_tool(w.url, A_CLIENT, tool, _args_for(tool, sid, "beta/secret"))
+    assert r.is_error
+    # A has no token of its own: it is sent to A's Forgejo to authorize.
+    assert f"https://{A_HOST}/login/oauth/authorize?" in r.text
+    assert B_HOST not in r.text
+    assert w.fake.requests == []
+    assert w.services.store.get_token("tenant-b", "gateway") == {
+        "access_token": B_STORED,
+        "expires_at": 0,
+    }
+    # And B itself still works with its own stored token.
+    b_sid = await _session(w.url, B_CLIENT)
+    ok = await call_tool(
+        w.url, B_CLIENT, "list_branches", {"session_id": b_sid, "repo": "beta/secret"}
+    )
+    assert not ok.is_error, ok.text
+    assert {(x.host, x.token) for x in w.fake.requests} == {(B_HOST, B_STORED)}

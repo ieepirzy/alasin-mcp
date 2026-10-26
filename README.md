@@ -186,7 +186,7 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `server.master_key_file` / `_env` | none | Base64 of 32 random bytes (`openssl rand -base64 32`). Required for `user_delegated`. |
 | `server.session_ttl_seconds` | `43200` | Work-session lifetime. |
 | `telemetry.otlp_endpoint` | `""` (off) | OTLP/HTTP traces endpoint. |
-| `[[auth.static]]` | | `token_file`/`token_env`, `tenant`, `subject`. |
+| `[[auth.static]]` | | `token_file`/`token_env`, `tenant`, `subject`. Re-read every 30 s, so rotation needs no restart; list two entries to overlap old and new. The Forgejo service token is re-read on every call. |
 | `[auth.jwt]` | | `jwks_url`, `issuer`, `audience`, `algorithms`, `tenant_claim`, `subject_claim`, `name_claim`, `email_claim`, `default_tenant`. |
 | `[[tenants]] id` | | Lowercase tenant ID. |
 | `forgejo_url` | | Base URL of the tenant's Forgejo. |

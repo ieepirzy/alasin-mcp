@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -57,23 +58,54 @@ class TokenVerifier(Protocol):
 
 
 class StaticTokenVerifier:
-    """Accept a fixed set of bearer credentials, compared in constant time."""
+    """Accept a fixed set of bearer credentials, compared in constant time.
 
-    def __init__(self, credentials: list[tuple[str, str, str]]):
-        # (token, tenant, subject); only the SHA-256 of each token is kept.
-        self._entries = [
+    Credentials given as secret references (``from_config``) are re-read every
+    ``reload_seconds``, so rotating the file or variable needs no restart. List
+    two ``[[auth.static]]`` entries for the same tenant and subject to keep the
+    old and new credential valid while the gateway switches over.
+    """
+
+    def __init__(
+        self,
+        credentials: list[tuple[str, str, str]] | None = None,
+        refs: tuple[StaticCredential, ...] = (),
+        reload_seconds: float = 30.0,
+    ):
+        self._fixed = [
             (hashlib.sha256(tok.encode()).digest(), validation.tenant_id(tenant), subject)
-            for tok, tenant, subject in credentials
+            for tok, tenant, subject in credentials or []
         ]
+        self._refs = refs
+        self._reload = reload_seconds
+        self._loaded: list[tuple[bytes, str, str]] = []
+        self._loaded_at = float("-inf")
+        if refs:
+            self._load()
 
     @classmethod
     def from_config(cls, creds: tuple[StaticCredential, ...]) -> StaticTokenVerifier:
-        return cls([(c.token.resolve(), c.tenant, c.subject) for c in creds])
+        return cls(refs=creds)
+
+    def _load(self) -> None:
+        loaded = []
+        for c in self._refs:
+            try:
+                token = c.token.resolve()
+            except (OSError, ValueError):
+                # A credential mid-rotation (file briefly missing) is skipped,
+                # not fatal; the others keep working.
+                continue
+            loaded.append((hashlib.sha256(token.encode()).digest(), c.tenant, c.subject))
+        self._loaded = loaded
+        self._loaded_at = time.monotonic()
 
     async def verify(self, token: str) -> Principal | None:
+        if self._refs and time.monotonic() - self._loaded_at > self._reload:
+            self._load()
         digest = hashlib.sha256(token.encode()).digest()
         found: Principal | None = None
-        for expected, tenant, subject in self._entries:
+        for expected, tenant, subject in self._fixed + self._loaded:
             # No early exit, so timing does not reveal which entry matched.
             if hmac.compare_digest(digest, expected):
                 found = Principal(tenant=tenant, subject=subject)
