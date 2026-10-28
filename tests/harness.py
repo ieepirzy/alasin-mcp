@@ -177,7 +177,9 @@ class FakeForgejo:
             return httpx.Response(200, json=items if page == 1 else [])
         if len(parts) < 3 or parts[0] != "repos":
             return httpx.Response(404, json={"message": "not found"})
-        full = f"{parts[1]}/{parts[2]}"
+        # Like Forgejo: the lookup ignores case, the answer uses the stored spelling.
+        typed = f"{parts[1]}/{parts[2]}".casefold()
+        full = next((k for k in repos if k.casefold() == typed), typed)
         repo = repos.get(full)
         if repo is None:
             return httpx.Response(404, json={"message": "repo not found"})
