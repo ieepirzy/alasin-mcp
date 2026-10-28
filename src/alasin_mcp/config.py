@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import validation
 
@@ -25,6 +26,15 @@ DEFAULT_CI_PATHS = (".forgejo/", ".gitea/", ".github/")
 
 class ConfigError(ValueError):
     pass
+
+
+# Subjects of OAuth front-door principals start with this (oauth.py). No other
+# credential may claim it, so an OAuth client never shares sessions with one.
+OAUTH_SUBJECT_PREFIX = "oauth:"
+# public_registration lets anyone who can reach the server register a client
+# and get a token for the tenant: origo has no user accounts. Opting in takes
+# this key as well, so it can't be switched on by accident.
+PUBLIC_REGISTRATION_ACK = "public_registration_i_understand_anyone_can_connect"
 
 
 class AuthMode(StrEnum):
@@ -356,8 +366,14 @@ def parse(raw: dict[str, Any]) -> Config:
         raise ConfigError(
             "no inbound auth configured: add [[auth.static]], [auth.jwt] or [auth.oauth]"
         )
-    if oauth is not None and oauth.tenant not in ids:
-        raise ConfigError(f"auth.oauth for unknown tenant {oauth.tenant!r}")
+    if oauth is not None:
+        _check_oauth(oauth, tenants, server)
+    for c in statics:
+        if c.subject.startswith(OAUTH_SUBJECT_PREFIX):
+            raise ConfigError(
+                f"static credential subject {c.subject!r}: the prefix "
+                f"{OAUTH_SUBJECT_PREFIX!r} is reserved for OAuth clients"
+            )
     for c in statics:
         if c.tenant not in ids:
             raise ConfigError(f"static credential for unknown tenant {c.tenant!r}")
@@ -388,6 +404,11 @@ def _oauth_server(raw: dict[str, Any], server: ServerConfig) -> OAuthServerConfi
         for c in raw.get("clients", ())
     )
     public = bool(raw.get("public_registration", False))
+    if public and raw.get(PUBLIC_REGISTRATION_ACK) is not True:
+        raise ConfigError(
+            "auth.oauth public_registration lets anyone who can reach this server get a "
+            f"token for the tenant; to accept that, also set {PUBLIC_REGISTRATION_ACK} = true"
+        )
     if not clients and not public:
         raise ConfigError("auth.oauth: add [[auth.oauth.clients]] or set public_registration")
     client_ttl = raw.get("client_ttl_seconds")
@@ -403,6 +424,26 @@ def _oauth_server(raw: dict[str, Any], server: ServerConfig) -> OAuthServerConfi
         client_ttl_seconds=int(client_ttl) if client_ttl is not None else None,
         storage_path=str(raw.get("storage_path", OAuthServerConfig.storage_path)),
     )
+
+
+def _check_oauth(
+    oauth: OAuthServerConfig, tenants: tuple[TenantConfig, ...], server: ServerConfig
+) -> None:
+    tenant = next((t for t in tenants if t.id == oauth.tenant), None)
+    if tenant is None:
+        raise ConfigError(f"auth.oauth for unknown tenant {oauth.tenant!r}")
+    # One subject per OAuth client, not per person: every user of a connector
+    # would share its work sessions and, in these modes, its Forgejo tokens.
+    if tenant.auth_mode is not AuthMode.SERVICE_ACCOUNT:
+        raise ConfigError(
+            f"auth.oauth tenant {tenant.id!r} must use auth_mode = service_account: "
+            "OAuth principals are per client, not per person"
+        )
+    # Clients sign in through a browser at base_url, so its host must also be
+    # covered by the DNS-rebinding check.
+    host = urlsplit(oauth.base_url).netloc
+    if host not in server.allowed_hosts:
+        raise ConfigError(f"auth.oauth: add the base_url host {host!r} to server.allowed_hosts")
 
 
 def load(path: str | os.PathLike[str]) -> Config:

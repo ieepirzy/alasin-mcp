@@ -21,6 +21,7 @@ from alasin_mcp.app import build_app
 from alasin_mcp.audit import MemoryAuditSink
 from alasin_mcp.auth import StaticTokenVerifier
 from alasin_mcp.config import (
+    PUBLIC_REGISTRATION_ACK,
     AuthMode,
     ConfigError,
     OAuthClientConfig,
@@ -73,8 +74,15 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TEST_OAUTH", SECRET)
 
 
-async def _sign_in(base: str) -> str:
+async def _sign_in(base: str, secret: str = SECRET) -> str:
     """The authorization-code + PKCE flow a connector runs; returns the access token."""
+    tok = await _exchange(base, secret)
+    assert tok.status_code == 200, tok.text
+    return tok.json()["access_token"]
+
+
+async def _exchange(base: str, secret: str) -> httpx.Response:
+    """Authorize, then exchange the code with ``secret``; returns the /token response."""
     async with httpx.AsyncClient(follow_redirects=False, timeout=10) as h:
         meta = await h.get(f"{base}/.well-known/oauth-protected-resource")
         assert meta.status_code == 200, meta.text
@@ -95,20 +103,18 @@ async def _sign_in(base: str) -> str:
         )
         assert r.status_code == 302, r.text
         code = parse_qs(urlparse(r.headers["location"]).query)["code"][0]
-        tok = await h.post(
+        return await h.post(
             f"{base}/token",
             data={
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": REDIRECT,
                 "client_id": CLIENT,
-                "client_secret": SECRET,
+                "client_secret": secret,
                 "code_verifier": verifier,
                 "resource": resource,
             },
         )
-        assert tok.status_code == 200, tok.text
-        return tok.json()["access_token"]
 
 
 async def test_signed_in_client_reaches_the_tools() -> None:
@@ -137,17 +143,46 @@ async def test_unauthenticated_request_is_pointed_at_discovery() -> None:
 
 async def test_wrong_client_secret_gets_no_token() -> None:
     with running() as base:
-        async with httpx.AsyncClient(timeout=10) as h:
-            r = await h.post(
-                f"{base}/token",
-                data={
-                    "grant_type": "client_credentials",
+        r = await _exchange(base, "wrong")
+        assert r.status_code in (400, 401), r.text
+        assert "access_token" not in r.text
+
+
+async def test_unregistered_redirect_uri_is_refused() -> None:
+    with running() as base:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=10) as h:
+            r = await h.get(
+                f"{base}/authorize",
+                params={
+                    "response_type": "code",
                     "client_id": CLIENT,
-                    "client_secret": "wrong",
+                    "redirect_uri": "https://evil.example.com/cb",
+                    "code_challenge": "x" * 43,
+                    "code_challenge_method": "S256",
                 },
             )
-            assert r.status_code >= 400
-            assert "access_token" not in r.text
+            # Never a redirect to the unregistered URI with a code.
+            assert r.status_code == 400, (r.status_code, r.headers.get("location"))
+            assert "evil.example.com" not in r.headers.get("location", "")
+
+
+async def test_registration_is_refused_when_off() -> None:
+    with running() as base:
+        async with httpx.AsyncClient(timeout=10) as h:
+            r = await h.post(
+                f"{base}/register",
+                json={"redirect_uris": ["https://evil.example.com/cb"], "client_name": "x"},
+            )
+            assert r.status_code in (400, 401, 403), r.text
+            assert "client_id" not in r.text
+
+
+async def test_rfc9728_resource_metadata_path_is_public() -> None:
+    with running() as base:
+        async with httpx.AsyncClient(timeout=10) as h:
+            r = await h.get(f"{base}/.well-known/oauth-protected-resource/mcp")
+            assert r.status_code == 200, r.text
+            assert r.json()["resource"] == f"{base}/mcp"
 
 
 async def test_oauth_subject_is_namespaced_from_static_subjects() -> None:
@@ -163,7 +198,10 @@ async def test_oauth_subject_is_namespaced_from_static_subjects() -> None:
 # -- config --------------------------------------------------------------------------------
 
 BASE: dict[str, Any] = {
-    "server": {"public_url": "https://alasin.example.com/"},
+    "server": {
+        "public_url": "https://alasin.example.com/",
+        "allowed_hosts": ["alasin.example.com"],
+    },
     "tenants": [
         {
             "id": "t",
@@ -198,6 +236,40 @@ def test_oauth_alone_is_enough_inbound_auth() -> None:
 def test_bad_oauth_config_refused(bad: dict[str, Any]) -> None:
     with pytest.raises(ConfigError):
         parse({**BASE, "auth": {"oauth": bad}})
+
+
+@pytest.mark.parametrize("mode", ["user_delegated", "platform_scoped"])
+def test_oauth_tenant_must_be_service_account(mode: str) -> None:
+    extra: dict[str, Any] = {"auth_mode": mode}
+    if mode == "user_delegated":
+        extra["oauth"] = {"client_id": "f", "client_secret_env": "S", "redirect_uri": "https://x"}
+    t = {**BASE["tenants"][0], **extra}
+    server = {**BASE["server"], "master_key_env": "K"}
+    with pytest.raises(ConfigError, match="service_account"):
+        parse({**BASE, "server": server, "tenants": [t], "auth": {"oauth": OAUTH}})
+
+
+def test_public_registration_needs_the_acknowledgement() -> None:
+    public = {"tenant": "t", "public_registration": True}
+    with pytest.raises(ConfigError, match=PUBLIC_REGISTRATION_ACK):
+        parse({**BASE, "auth": {"oauth": public}})
+    with pytest.raises(ConfigError, match=PUBLIC_REGISTRATION_ACK):
+        parse({**BASE, "auth": {"oauth": {**public, PUBLIC_REGISTRATION_ACK: "yes"}}})
+    cfg = parse({**BASE, "auth": {"oauth": {**public, PUBLIC_REGISTRATION_ACK: True}}})
+    assert cfg.oauth is not None and cfg.oauth.public_registration
+
+
+def test_oauth_subject_prefix_is_reserved_for_static_credentials() -> None:
+    static = {"token_env": "T", "tenant": "t", "subject": "oauth:connector"}
+    with pytest.raises(ConfigError, match="reserved"):
+        parse({**BASE, "auth": {"static": [static]}})
+
+
+@pytest.mark.parametrize("allowed", [[], ["other.example.com"]])
+def test_oauth_host_must_be_an_allowed_host(allowed: list[str]) -> None:
+    server = {**BASE["server"], "allowed_hosts": allowed}
+    with pytest.raises(ConfigError, match="allowed_hosts"):
+        parse({**BASE, "server": server, "auth": {"oauth": OAUTH}})
 
 
 def test_oauth_needs_a_base_url() -> None:

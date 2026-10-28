@@ -30,11 +30,7 @@ from typing import Any, Protocol
 from starlette.applications import Starlette
 
 from .auth import Principal, TokenVerifier
-from .config import ConfigError, OAuthServerConfig
-
-# Prefixes the subject, so an OAuth client can never share sessions with a
-# static credential whose subject happens to equal its client id.
-SUBJECT_PREFIX = "oauth:"
+from .config import OAUTH_SUBJECT_PREFIX, ConfigError, OAuthServerConfig
 
 
 class OAuthFrontDoor(Protocol):
@@ -63,7 +59,7 @@ class _OrigoVerifier:
         client = meta.get("client_id")
         if not isinstance(client, str) or not client:
             return None
-        return Principal(tenant=self._tenant, subject=SUBJECT_PREFIX + client)
+        return Principal(tenant=self._tenant, subject=OAUTH_SUBJECT_PREFIX + client)
 
 
 class OrigoFrontDoor:

@@ -31,7 +31,7 @@ import jwt
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import validation
-from .config import JwtConfig, StaticCredential
+from .config import OAUTH_SUBJECT_PREFIX, JwtConfig, StaticCredential
 
 PRINCIPAL_SCOPE_KEY = "alasin.principal"
 
@@ -143,6 +143,9 @@ class JwtVerifier:
         tenant = claims.get(cfg.tenant_claim) or cfg.default_tenant
         subject = claims.get(cfg.subject_claim)
         if not isinstance(tenant, str) or not isinstance(subject, str) or not subject:
+            return None
+        # Reserved for OAuth front-door clients; an issuer can't claim it.
+        if subject.startswith(OAUTH_SUBJECT_PREFIX):
             return None
         try:
             validation.tenant_id(tenant)

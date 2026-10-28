@@ -40,6 +40,9 @@ gateway = true
 # tenant = "default"
 # base_url = "https://alasin.example.com"   # default: server.public_url
 # storage_path = "/var/lib/alasin/oauth.db" # "" keeps tokens in memory
+# The tenant must be service_account, and base_url's host must be in
+# server.allowed_hosts. Never public_registration on an open network: origo
+# checks no user, so anyone could register a client (see README).
 # [[auth.oauth.clients]]
 # id = "claude-connector"
 # secret_file = "/run/secrets/alasin_oauth_client_secret"
