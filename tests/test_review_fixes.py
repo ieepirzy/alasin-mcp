@@ -685,6 +685,8 @@ async def test_webhook_sends_the_repo_as_forgejo_spells_it(
 ) -> None:
     monkeypatch.setenv("TEST_HOOK", HOOK_SECRET)
     fake = _fake()
+    # Stored in mixed case, so lowercasing what was typed is not enough.
+    fake.hosts[HOST]["repos"]["Acme/Shop"] = FakeRepo(branches={"main": {"a.txt": b"a\n"}})
     hook = HookServer(fake)
     try:
         for r in running(fake, **_hook_tenant_kw(hook.url)):
@@ -693,10 +695,10 @@ async def test_webhook_sends_the_repo_as_forgejo_spells_it(
                 r.url,
                 "gw",
                 "create_branch",
-                {"session_id": sid, "repo": "ACME/Site", "branch": "lane/new"},
+                {"session_id": sid, "repo": "acme/SHOP", "branch": "lane/new"},
             )
             assert not res.is_error, res.text
-            assert [p["repo"] for p in hook.received] == ["acme/site"]
+            assert [p["repo"] for p in hook.received] == ["Acme/Shop"]
     finally:
         hook.close()
 
