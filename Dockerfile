@@ -13,7 +13,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 RUN pip install --no-cache-dir uv==0.13.0 \
-    && uv sync --locked --no-dev \
+    && uv sync --locked --no-dev --extra origo \
     && useradd --system --uid 10001 --home-dir /var/lib/alasin alasin \
     && mkdir -p /var/lib/alasin/audit \
     && chown -R alasin /var/lib/alasin

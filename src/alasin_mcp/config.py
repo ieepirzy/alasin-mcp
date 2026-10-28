@@ -156,6 +156,35 @@ class JwtConfig:
 
 
 @dataclass(frozen=True)
+class OAuthClientConfig:
+    """A client pre-registered with the OAuth front door (e.g. a claude.ai connector)."""
+
+    id: str
+    secret: SecretRef
+    # Exact-match allowlist; a client with none can't complete /authorize.
+    redirect_uris: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class OAuthServerConfig:
+    """The OAuth front door MCP clients sign in through (see oauth.py)."""
+
+    tenant: str
+    provider: str = "origo"
+    # Externally visible base URL; defaults to server.public_url.
+    base_url: str = ""
+    clients: tuple[OAuthClientConfig, ...] = ()
+    public_registration: bool = False
+    auto_approve: bool = False
+    token_ttl_seconds: int = 3600
+    refresh_token_ttl_seconds: int = 30 * 24 * 3600
+    client_ttl_seconds: int | None = None
+    # SQLite file for tokens and registered clients; empty keeps them in
+    # memory, so every client signs in again after a restart.
+    storage_path: str = "/var/lib/alasin/oauth.db"
+
+
+@dataclass(frozen=True)
 class ServerConfig:
     host: str = "0.0.0.0"  # noqa: S104 - a container binds all interfaces
     port: int = 8000
@@ -186,6 +215,7 @@ class Config:
     tenants: tuple[TenantConfig, ...]
     static_credentials: tuple[StaticCredential, ...] = ()
     jwt: JwtConfig | None = None
+    oauth: OAuthServerConfig | None = None
 
 
 def _secret(raw: dict[str, Any], name: str) -> SecretRef:
@@ -321,8 +351,13 @@ def parse(raw: dict[str, Any]) -> Config:
             email_claim=str(j.get("email_claim", "email")),
             default_tenant=str(j.get("default_tenant", "")),
         )
-    if not statics and jwt is None:
-        raise ConfigError("no inbound auth configured: add [[auth.static]] or [auth.jwt]")
+    oauth = _oauth_server(auth["oauth"], server) if "oauth" in auth else None
+    if not statics and jwt is None and oauth is None:
+        raise ConfigError(
+            "no inbound auth configured: add [[auth.static]], [auth.jwt] or [auth.oauth]"
+        )
+    if oauth is not None and oauth.tenant not in ids:
+        raise ConfigError(f"auth.oauth for unknown tenant {oauth.tenant!r}")
     for c in statics:
         if c.tenant not in ids:
             raise ConfigError(f"static credential for unknown tenant {c.tenant!r}")
@@ -337,7 +372,37 @@ def parse(raw: dict[str, Any]) -> Config:
     needs_key = any(x.auth_mode is AuthMode.USER_DELEGATED for x in tenants)
     if needs_key and not server.master_key.configured:
         raise ConfigError("user_delegated mode stores tokens: set server.master_key_file/_env")
-    return Config(server, telemetry, tenants, statics, jwt)
+    return Config(server, telemetry, tenants, statics, jwt, oauth)
+
+
+def _oauth_server(raw: dict[str, Any], server: ServerConfig) -> OAuthServerConfig:
+    base_url = str(raw.get("base_url", server.public_url)).rstrip("/")
+    if not base_url.startswith(("https://", "http://")):
+        raise ConfigError("auth.oauth needs base_url (or server.public_url): clients sign in there")
+    clients = tuple(
+        OAuthClientConfig(
+            id=str(c["id"]),
+            secret=_secret(c, "secret"),
+            redirect_uris=tuple(str(u) for u in c.get("redirect_uris", ())),
+        )
+        for c in raw.get("clients", ())
+    )
+    public = bool(raw.get("public_registration", False))
+    if not clients and not public:
+        raise ConfigError("auth.oauth: add [[auth.oauth.clients]] or set public_registration")
+    client_ttl = raw.get("client_ttl_seconds")
+    return OAuthServerConfig(
+        tenant=validation.tenant_id(str(raw["tenant"])),
+        provider=str(raw.get("provider", "origo")),
+        base_url=base_url,
+        clients=clients,
+        public_registration=public,
+        auto_approve=bool(raw.get("auto_approve", False)),
+        token_ttl_seconds=int(raw.get("token_ttl_seconds", 3600)),
+        refresh_token_ttl_seconds=int(raw.get("refresh_token_ttl_seconds", 30 * 24 * 3600)),
+        client_ttl_seconds=int(client_ttl) if client_ttl is not None else None,
+        storage_path=str(raw.get("storage_path", OAuthServerConfig.storage_path)),
+    )
 
 
 def load(path: str | os.PathLike[str]) -> Config:

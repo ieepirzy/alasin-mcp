@@ -188,12 +188,14 @@ class BearerAuthMiddleware:
         public_paths: tuple[str, ...] = ("/healthz",),
         public_prefixes: tuple[str, ...] = (),
         max_body_bytes: int = 8 * 1024 * 1024,
+        challenge: bytes = b'Bearer error="invalid_token"',
     ):
         self.app = app
         self.verifier = verifier
         self.public_paths = public_paths
         self.public_prefixes = public_prefixes
         self.max_body_bytes = max_body_bytes
+        self.challenge = challenge
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -217,7 +219,7 @@ class BearerAuthMiddleware:
         token = _bearer(scope)
         principal = await self.verifier.verify(token) if token else None
         if principal is None:
-            await _unauthorized(send)
+            await _error(send, 401, "invalid_token", [(b"www-authenticate", self.challenge)])
             return
         scope[PRINCIPAL_SCOPE_KEY] = principal
         await self.app(scope, receive, send)
@@ -242,12 +244,6 @@ def _content_length(scope: Scope) -> int | None:
             except ValueError:
                 return None
     return None
-
-
-async def _unauthorized(send: Send) -> None:
-    await _error(
-        send, 401, "invalid_token", [(b"www-authenticate", b'Bearer error="invalid_token"')]
-    )
 
 
 async def _error(

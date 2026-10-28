@@ -33,6 +33,18 @@ gateway = true
 # audience = "alasin-mcp"
 # tenant_claim = "tenant"
 
+# Or let MCP clients (e.g. a claude.ai connector) sign in here over OAuth 2.1 +
+# PKCE. Needs the origo extra. Static credentials above keep working beside it.
+# [auth.oauth]
+# provider = "origo"
+# tenant = "default"
+# base_url = "https://alasin.example.com"   # default: server.public_url
+# storage_path = "/var/lib/alasin/oauth.db" # "" keeps tokens in memory
+# [[auth.oauth.clients]]
+# id = "claude-connector"
+# secret_file = "/run/secrets/alasin_oauth_client_secret"
+# redirect_uris = ["https://claude.ai/api/mcp/auth_callback"]
+
 [[tenants]]
 id = "default"
 forgejo_url = "https://forgejo.example.com"

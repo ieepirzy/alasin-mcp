@@ -37,9 +37,9 @@ def free_port() -> int:
 
 
 @contextmanager
-def serve(app: Starlette) -> Iterator[str]:
+def serve(app: Starlette, port: int | None = None) -> Iterator[str]:
     """Run ``app`` under uvicorn in a thread; yield its /mcp URL."""
-    port = free_port()
+    port = port or free_port()
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="on")
     )
