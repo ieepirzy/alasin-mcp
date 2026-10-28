@@ -14,7 +14,9 @@ Webhook request: ``POST <url>`` with a JSON body
   ``"<timestamp>." + <raw body>`` with the tenant's webhook secret.
 
 The receiver should check the signature, reject stale timestamps, and answer
-2xx once it has accepted the request.
+2xx once it has accepted the request. On a refusal it may answer a JSON body
+``{"error": "<reason>"}``; the reason reaches the model, so it can correct
+the request.
 
 Register another strategy by implementing ``BranchCreator`` and adding it to
 ``Services.branch_creators`` under a name tenants can select.
@@ -69,6 +71,22 @@ def sign(secret: str, timestamp: str, body: bytes) -> str:
     return "sha256=" + mac.hexdigest()
 
 
+_REASON_MAX = 300
+
+
+def refusal_reason(resp: httpx.Response) -> str | None:
+    """The receiver's ``error`` text, single-line and bounded, or None."""
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None
+    reason = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(reason, str):
+        return None
+    reason = " ".join("".join(c if c.isprintable() else " " for c in reason).split())
+    return reason[:_REASON_MAX] or None
+
+
 class WebhookBranchCreator:
     def __init__(self, transport: httpx.AsyncBaseTransport | None = None):
         self._transport = transport
@@ -103,9 +121,9 @@ class WebhookBranchCreator:
         ) as http:
             resp = await http.post(hook.url, content=body, headers=headers)
         if not 200 <= resp.status_code < 300:
-            raise BranchCreationError(
-                f"the branch creation service refused the request ({resp.status_code})"
-            )
+            message = f"the branch creation service refused the request ({resp.status_code})"
+            reason = refusal_reason(resp) if 400 <= resp.status_code < 500 else None
+            raise BranchCreationError(f"{message}: {reason}" if reason else message)
         deadline = time.monotonic() + hook.timeout_seconds
         while True:
             branch = await client.branch(request.repo, request.branch)

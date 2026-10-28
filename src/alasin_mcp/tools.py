@@ -181,6 +181,14 @@ def repo_allowed(tenant: TenantConfig, full_name: str) -> bool:
     return any(fnmatch.fnmatchcase(name, pat.casefold()) for pat in tenant.repos)
 
 
+def canonical_repo(repo: RepoRef, info: dict[str, Any]) -> RepoRef:
+    """The repo as Forgejo spells it. Lookups ignore case; other services may not."""
+    owner, _, name = str(info.get("full_name") or "").partition("/")
+    if name and f"{owner}/{name}".casefold() == repo.full_name.casefold():
+        return RepoRef(owner, name)
+    return repo
+
+
 @dataclass
 class Services:
     resolver: TenantResolver
@@ -767,7 +775,12 @@ def build_server(services: Services) -> MCPServer:
                 assert call.session is not None
                 sha = await creator.create(
                     BranchRequest(
-                        call.tenant, call.principal, call.session.session_id, r, name, source
+                        call.tenant,
+                        call.principal,
+                        call.session.session_id,
+                        canonical_repo(r, info),
+                        name,
+                        source,
                     ),
                     client,
                 )

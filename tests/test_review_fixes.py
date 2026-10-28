@@ -562,8 +562,14 @@ HOOK_SECRET = "hook-secret"
 class HookServer:
     """A stub branch-creation service: checks the signature, then creates the branch."""
 
-    def __init__(self, fake: FakeForgejo, create: bool = True, delay: float = 0.3):
-        self.fake, self.create, self.delay = fake, create, delay
+    def __init__(
+        self,
+        fake: FakeForgejo,
+        create: bool = True,
+        delay: float = 0.3,
+        refuse: tuple[int, bytes] | None = None,
+    ):
+        self.fake, self.create, self.delay, self.refuse = fake, create, delay, refuse
         self.received: list[dict[str, Any]] = []
         port = free_port()
         outer = self
@@ -584,6 +590,14 @@ class HookServer:
                     return
                 payload = json.loads(body)
                 outer.received.append(payload)
+                if outer.refuse is not None:
+                    status, content = outer.refuse
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
                 if outer.create:
 
                     def later() -> None:
@@ -662,6 +676,71 @@ async def test_webhook_wrong_secret_is_refused(monkeypatch: pytest.MonkeyPatch) 
                 {"session_id": sid, "repo": "acme/site", "branch": "b"},
             )
             assert res.is_error and "refused the request (401)" in res.text
+    finally:
+        hook.close()
+
+
+async def test_webhook_sends_the_repo_as_forgejo_spells_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_HOOK", HOOK_SECRET)
+    fake = _fake()
+    # Stored in mixed case, so lowercasing what was typed is not enough.
+    fake.hosts[HOST]["repos"]["Acme/Shop"] = FakeRepo(branches={"main": {"a.txt": b"a\n"}})
+    hook = HookServer(fake)
+    try:
+        for r in running(fake, **_hook_tenant_kw(hook.url)):
+            sid = await _sid(r.url)
+            res = await call_tool(
+                r.url,
+                "gw",
+                "create_branch",
+                {"session_id": sid, "repo": "acme/SHOP", "branch": "lane/new"},
+            )
+            assert not res.is_error, res.text
+            assert [p["repo"] for p in hook.received] == ["Acme/Shop"]
+    finally:
+        hook.close()
+
+
+async def test_webhook_refusal_reason_reaches_the_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TEST_HOOK", HOOK_SECRET)
+    fake = _fake()
+    reason = "branch must match lane/[a-z0-9][a-z0-9-]{0,62}"
+    hook = HookServer(fake, refuse=(400, json.dumps({"error": reason + "\n" + "x" * 400}).encode()))
+    try:
+        for r in running(fake, **_hook_tenant_kw(hook.url)):
+            sid = await _sid(r.url)
+            res = await call_tool(
+                r.url,
+                "gw",
+                "create_branch",
+                {"session_id": sid, "repo": "acme/site", "branch": "lane/Fix_Copy"},
+            )
+            assert res.is_error
+            assert f"refused the request (400): {reason} x" in res.text
+            assert "x" * 300 not in res.text
+    finally:
+        hook.close()
+
+
+async def test_webhook_server_error_body_is_not_passed_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_HOOK", HOOK_SECRET)
+    fake = _fake()
+    hook = HookServer(fake, refuse=(500, b'{"error": "internal detail"}'))
+    try:
+        for r in running(fake, **_hook_tenant_kw(hook.url)):
+            sid = await _sid(r.url)
+            res = await call_tool(
+                r.url,
+                "gw",
+                "create_branch",
+                {"session_id": sid, "repo": "acme/site", "branch": "lane/new"},
+            )
+            assert res.is_error and "refused the request (500)" in res.text
+            assert "internal detail" not in res.text
     finally:
         hook.close()
 
