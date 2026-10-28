@@ -249,3 +249,5 @@ async def test_jwt_verifier() -> None:
     assert await v.verify(_jwt(key, exp=int(time.time()) - 10)) is None
     assert await v.verify(_jwt(key, tenant=None)) is None
     assert await v.verify(_jwt(key, tenant="../etc")) is None
+    # The OAuth front door's subject prefix is reserved.
+    assert await v.verify(_jwt(key, sub="oauth:connector")) is None

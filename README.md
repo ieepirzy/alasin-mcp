@@ -232,6 +232,8 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `server.max_request_bytes` | 8 MiB | Largest request body, checked before authentication. |
 | `[[auth.static]]` | | `token_file`/`token_env`, `tenant`, `subject`, `gateway` (may send the trusted author header). Re-read every 30 s, so rotation needs no restart; list two entries to overlap old and new. The Forgejo service token is re-read on every call. |
 | `[auth.jwt]` | | `jwks_url`, `issuer`, `audience`, `algorithms`, `tenant_claim`, `subject_claim`, `name_claim`, `email_claim`, `default_tenant`. |
+| `[auth.oauth]` | | The OAuth front door; see *OAuth sign-in*. `provider` (`origo`), `tenant` (a `service_account` tenant), `base_url` (default `server.public_url`; its host must be in `server.allowed_hosts`), `public_registration` (`false`; see the warning under *OAuth sign-in*), `auto_approve` (`false`), `token_ttl_seconds` (3600), `refresh_token_ttl_seconds` (30 days), `client_ttl_seconds`, `storage_path` (`/var/lib/alasin/oauth.db`; `""` = memory). |
+| `[[auth.oauth.clients]]` | | `id`, `secret_file`/`secret_env`, `redirect_uris` (exact match). Read at start-up: a new secret needs a restart. |
 | `[[tenants]] id` | | Lowercase tenant ID. |
 | `forgejo_url` | | Base URL of the tenant's Forgejo. |
 | `auth_mode` | `service_account` | `service_account`, `user_delegated` or `platform_scoped`. |
@@ -248,6 +250,40 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `allow_ci_paths`, `ci_paths` | `false`, `.forgejo/`, `.gitea/`, `.github/` | CI workflow folders; see *Security model*. |
 | `branch_creation` | `api` | `api`, `webhook`, or a registered name; see *Branch creation*. |
 | `[tenants.branch_webhook]` | | `url`, `secret_file`/`secret_env`, `timeout_seconds` (60), `poll_interval_seconds` (2). |
+
+## OAuth sign-in
+
+With `[auth.oauth]`, MCP clients that speak OAuth, such as claude.ai connectors, sign in
+to this server directly; no gateway is needed. `provider = "origo"` runs
+[origo](https://github.com/ieepirzy/origo), an OAuth 2.1 + PKCE authorization server, in
+this process. Install it with the extra: `pip install 'alasin-mcp[origo]'` (the image
+includes it).
+
+- A request to `/mcp` without a valid token gets a 401 whose `WWW-Authenticate` names the
+  protected-resource metadata, so the client can discover where to sign in.
+- The discovery and sign-in routes (`/.well-known/...`, `/authorize`, `/token`,
+  `/register`, `/userinfo`) are public; each checks its own credentials.
+- Every token from the front door belongs to the one `tenant` configured. Its subject is
+  `oauth:<client id>`: the OAuth client, not a person. origo has no user accounts, so
+  everyone who signs in through one client shares its work sessions. For that reason the
+  tenant must use `auth_mode = "service_account"`; a `user_delegated` or
+  `platform_scoped` tenant is refused, since it would share per-person Forgejo tokens.
+- The `oauth:` subject prefix is reserved: an `[[auth.static]]` subject using it is
+  refused, and a JWT whose subject starts with it is rejected.
+- The `base_url` host must be listed in `server.allowed_hosts`, so the DNS-rebinding
+  check covers the host clients sign in at.
+- `[[auth.static]]` and `[auth.jwt]` keep working beside it on the same `/mcp`, so a
+  machine caller (a tool registry listing tools, say) can keep a static bearer.
+
+> **Warning: `public_registration` lets anyone on the internet connect.** With it on, any
+> client that can reach this server registers itself at `/register` and gets a token for
+> the tenant: origo checks no user. It is refused unless the config also sets
+> `public_registration_i_understand_anyone_can_connect = true`. Leave it off and list
+> each client under `[[auth.oauth.clients]]`, unless something in front of this server
+> (a network policy, an access proxy) already limits who can reach it.
+
+Another OAuth or OIDC issuer can be added as a further front door (`oauth.py`): its
+verifier is a `JwtVerifier` against the issuer's JWKS.
 
 ## Running
 

@@ -20,6 +20,11 @@ dependencies = [
     "opentelemetry-exporter-otlp-proto-http==1.45.1",
 ]
 
+[project.optional-dependencies]
+# The in-process OAuth front door ([auth.oauth] provider = "origo"). Optional:
+# deployments that authenticate with static bearers or JWTs never load it.
+origo = ["origo==0.3.0"]
+
 [project.scripts]
 alasin-mcp = "alasin_mcp.app:main"
 

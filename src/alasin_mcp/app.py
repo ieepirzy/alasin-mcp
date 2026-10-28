@@ -7,6 +7,8 @@ Routes:
 - ``/healthz``: liveness, public.
 - ``/oauth/forgejo/callback``: the Forgejo OAuth redirect target for
   user-delegated tenants, public (it is protected by the single-use state).
+- With ``[auth.oauth]``: the front door's discovery and sign-in routes
+  (``/.well-known/...``, ``/authorize``, ``/token``, ...), public.
 
 Configuration: ``ALASIN_CONFIG`` names the TOML file (see README.md).
 """
@@ -42,6 +44,7 @@ from .credentials import (
     ServiceAccountProvider,
     UserDelegatedProvider,
 )
+from .oauth import OAuthFrontDoor, front_door
 from .store import LocalKeyWrapper, Store
 from .tenancy import StaticTenantResolver, TenantResolver
 from .tools import Services, build_server
@@ -61,6 +64,7 @@ def build_app(
     allowed_hosts: tuple[str, ...] = (),
     delegated: UserDelegatedProvider | None = None,
     max_request_bytes: int = 8 * 1024 * 1024,
+    oauth: OAuthFrontDoor | None = None,
 ) -> Starlette:
     server = build_server(services)
     security = TransportSecuritySettings(
@@ -94,11 +98,18 @@ def build_app(
         return HTMLResponse("Forgejo access is connected. You can close this tab.")
 
     app.router.routes.append(Route(CALLBACK_PATH, oauth_callback))
+    public_paths: tuple[str, ...] = ("/healthz", CALLBACK_PATH)
+    challenge = b'Bearer error="invalid_token"'
+    if oauth is not None:
+        public_paths += oauth.install(app)
+        verifier = ChainVerifier([verifier, oauth.verifier])
+        challenge = oauth.challenge()
     app.add_middleware(
         BearerAuthMiddleware,
         verifier=verifier,
-        public_paths=("/healthz", CALLBACK_PATH),
+        public_paths=public_paths,
         max_body_bytes=max_request_bytes,
+        challenge=challenge,
     )
     return app
 
@@ -143,12 +154,14 @@ def from_config(
         audit_sink=sink,
         session_ttl=cfg.server.session_ttl_seconds,
     )
+    oauth = front_door(cfg.oauth, cfg.oauth.base_url, MCP_PATH) if cfg.oauth else None
     return build_app(
         services,
         ChainVerifier(verifiers),
         cfg.server.allowed_hosts,
         delegated,
         cfg.server.max_request_bytes,
+        oauth,
     )
 
 
