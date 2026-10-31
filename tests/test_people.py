@@ -11,15 +11,17 @@ branch webhook, Forgejo's commit body) is the real code.
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+import anyio
 import httpx
 import pytest
 
 from alasin_mcp.app import build_app, from_config
-from alasin_mcp.auth import StaticTokenVerifier
+from alasin_mcp.auth import Principal, StaticTokenVerifier
 from alasin_mcp.config import (
     AuthorSource,
     ConfigError,
@@ -31,6 +33,7 @@ from alasin_mcp.config import (
 )
 from alasin_mcp.oauth import OrigoFrontDoor
 from alasin_mcp.store import LocalKeyWrapper, Store
+from alasin_mcp.tools import PolicyError
 from tests.harness import call_tool, fake_services, free_port, serve
 from tests.test_review_fixes import HOOK_SECRET, HookServer, _fake, _hook_tenant_kw, _tenant
 
@@ -300,13 +303,85 @@ async def test_recorded_branch_is_not_re_requested() -> None:
         assert len(p.hook.received) == 1
 
 
-async def test_a_branch_claimed_by_someone_else_cannot_be_created() -> None:
+async def test_a_branch_reserved_by_someone_else_cannot_be_created() -> None:
     with people() as p:
-        # Bob's creation is in flight: claimed, not yet in Forgejo.
-        p.services.store.claim_branch("t", "acme/site", "lane/race", f"oauth:{ISSUER}|bob-id")
+        # Bob's creation is in flight: reserved, not yet in Forgejo.
+        p.services.store.reserve_branch(
+            "t", "acme/site", "lane/race", f"oauth:{ISSUER}|bob-id", 600
+        )
         res = await p.create("alice", "lane/race")
         assert res.is_error and "already taken" in res.text
         assert p.hook.received == []
+
+
+class SlowRefusal:
+    """A ``refuse`` value the hook stub unpacks only after a delay: a sync bot
+    that takes its lock and fetches before answering 409."""
+
+    def __iter__(self) -> Iterator[Any]:
+        time.sleep(1.5)
+        yield 409
+        yield b'{"error": "registered to another owner"}'
+
+
+async def test_no_write_while_a_reclaim_is_unanswered() -> None:
+    # Review finding (PR #8): reclaim recorded Bob as owner before the bot
+    # answered, so a commit in that window landed on Alice's branch as Bob.
+    with people(refuse=SlowRefusal()) as p:  # type: ignore[arg-type]
+        sid_c, sid_k = await p.sid("bob"), await p.sid("bob")
+
+        async def commit_later() -> Any:
+            await anyio.sleep(0.7)
+            args = {
+                "session_id": sid_k,
+                "repo": "acme/site",
+                "branch": "work",
+                "message": "m",
+                "files": [{"path": "a.txt", "content": "by bob"}],
+            }
+            return await call_tool(p.url, "bob", "commit_files", args)
+
+        results: dict[str, Any] = {}
+
+        async def run(key: str, fn: Any) -> None:
+            results[key] = await fn()
+
+        args = {"session_id": sid_c, "repo": "acme/site", "branch": "work"}
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run, "create", lambda: call_tool(p.url, "bob", "create_branch", args))
+            tg.start_soon(run, "commit", commit_later)
+        assert results["create"].is_error and "another owner" in results["create"].text
+        assert results["commit"].is_error, results["commit"].text
+        assert "not created by you" in results["commit"].text
+        assert p.commits == []
+        assert p.services.store.branch_owner("t", "acme/site", "work") is None
+
+
+async def test_an_unanswered_reclaim_does_not_block_the_owner() -> None:
+    # A reclaim reserves nothing: Bob's re-request, still unanswered, can't
+    # hold the branch against Alice's; the receiver decides both.
+    with people(refuse=SlowRefusal()) as p:  # type: ignore[arg-type]
+        sid_b, sid_a = await p.sid("bob"), await p.sid("alice")
+        results: dict[str, Any] = {}
+
+        async def create(token: str, sid: str, delay: float) -> None:
+            await anyio.sleep(delay)
+            args = {"session_id": sid, "repo": "acme/site", "branch": "work"}
+            results[token] = await call_tool(p.url, token, "create_branch", args)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(create, "bob", sid_b, 0)
+            tg.start_soon(create, "alice", sid_a, 0.5)
+        assert "already taken" not in results["alice"].text
+        assert {r["owner_sub"] for r in p.hook.received} == {"bob-id", "alice-id"}
+
+
+async def test_no_write_while_a_creation_is_pending() -> None:
+    # The creator's own reservation is not ownership either.
+    with people() as p:
+        p.services.store.reserve_branch("t", "acme/site", "work", f"oauth:{ISSUER}|alice-id", 600)
+        res = await p.commit("alice", "work")
+        assert res.is_error and "not created by you" in res.text
 
 
 async def test_failed_creation_releases_the_claim() -> None:
@@ -346,14 +421,40 @@ async def test_gate_reads_this_tokens_groups() -> None:
             del TOKENS["bob-later"]
 
 
-def test_claim_is_first_come_and_release_is_the_claimers() -> None:
-    store = Store(":memory:", LocalKeyWrapper(os.urandom(32)))
-    assert store.claim_branch("t", "Acme/Site", "lane/x", "a") == ("a", True)
-    assert store.claim_branch("t", "acme/site", "lane/x", "a") == ("a", False)
-    assert store.claim_branch("t", "acme/site", "lane/x", "b") == ("a", False)
+def _store() -> Store:
+    return Store(":memory:", LocalKeyWrapper(os.urandom(32)))
+
+
+def test_reservation_is_first_come_and_never_ownership() -> None:
+    store = _store()
+    assert store.reserve_branch("t", "Acme/Site", "lane/x", "a", 600) == "a"
+    assert store.reserve_branch("t", "acme/site", "lane/x", "a", 600) == "a"
+    assert store.reserve_branch("t", "acme/site", "lane/x", "b", 600) == "a"
+    assert store.branch_owner("t", "acme/site", "lane/x") is None
     store.release_branch("t", "acme/site", "lane/x", "b")
+    assert store.reserve_branch("t", "acme/site", "lane/x", "b", 600) == "a"
+    store.release_branch("t", "acme/site", "lane/x", "a")
+    assert store.reserve_branch("t", "acme/site", "lane/x", "b", 600) == "b"
+
+
+def test_confirmed_owner_survives_release_and_holds_reservations() -> None:
+    store = _store()
+    store.reserve_branch("t", "acme/site", "lane/x", "a", 600)
+    store.confirm_branch("t", "acme/site", "lane/x", "a")
     assert store.branch_owner("t", "ACME/site", "lane/x") == "a"
     store.release_branch("t", "acme/site", "lane/x", "a")
+    assert store.branch_owner("t", "acme/site", "lane/x") == "a"
+    # A confirmed owner is never stale.
+    assert store.reserve_branch("t", "acme/site", "lane/x", "b", -1) == "a"
+
+
+def test_stale_reservation_is_dropped() -> None:
+    # A crash between reserving and the creator's answer leaves a pending row;
+    # it never counts as ownership and, once stale, holds nothing.
+    store = _store()
+    store.reserve_branch("t", "acme/site", "lane/x", "a", 600)
+    assert store.reserve_branch("t", "acme/site", "lane/x", "b", 600) == "a"
+    assert store.reserve_branch("t", "acme/site", "lane/x", "b", -1) == "b"
     assert store.branch_owner("t", "acme/site", "lane/x") is None
 
 
@@ -452,6 +553,59 @@ def test_identity_provider_from_the_environment() -> None:
     assert idp.client_secret == SecretRef(file="/etc/alasin/keycloak/client-secret")
     assert idp.allowed_groups == ("forgejo-lane", "other")
     assert idp.groups_claim == "groups"
+
+
+def test_grant_age_from_the_environment() -> None:
+    auth = _auth()
+    del auth["oauth"]["identity_provider"]
+    cfg = parse({**BASE, "auth": auth}, env={**ENV, "ALASIN_IDP_MAX_GRANT_AGE": "3600"})
+    assert cfg.oauth is not None and cfg.oauth.identity_provider is not None
+    assert cfg.oauth.identity_provider.max_grant_age_seconds == 3600
+    with pytest.raises(ConfigError, match="positive"):
+        parse({**BASE, "auth": auth}, env={**ENV, "ALASIN_IDP_MAX_GRANT_AGE": "0"})
+
+
+def test_grant_age_reaches_origo() -> None:
+    cfg = _oauth_cfg(
+        identity_provider=IdentityProviderConfig(
+            issuer=ISSUER,
+            client_id="alasin",
+            client_secret=SecretRef(env="TEST_IDP_SECRET"),
+            allowed_groups=(LANE,),
+            max_grant_age_seconds=3600,
+        ),
+        token_ttl_seconds=900,
+    )
+    provider: Any = OrigoFrontDoor(cfg, "http://127.0.0.1:1", "/mcp")._provider
+    assert provider.identity_provider.max_grant_age == 3600
+    assert provider.storage.token_ttl == 900
+
+
+def test_person_tenant_has_no_jwt_issuer() -> None:
+    jwt = {"jwks_url": "https://x/certs", "issuer": "https://x", "audience": "a"}
+    with pytest.raises(ConfigError, match="auth.jwt"):
+        parse({**BASE, "auth": {**_auth(), "jwt": jwt}})
+
+
+async def test_writes_need_an_identity_provider_principal() -> None:
+    # A principal that merely asserts the lane group (a JWT, a static
+    # credential) can't write in the person tenant.
+    with people() as p:
+        svc: Any = p.services
+        forged = Principal(
+            "t",
+            "forged",
+            "Forged",
+            "f@example.com",
+            claims={"groups": [LANE]},
+            email_verified=True,
+        )
+        t = p.services.resolver.resolve(forged)
+        with pytest.raises(PolicyError, match="identity provider"):
+            svc.check_writer(t, forged)
+        real = await _door().verifier.verify("alice")
+        assert real is not None
+        svc.check_writer(t, real)
 
 
 def test_identity_provider_from_one_source_only() -> None:

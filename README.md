@@ -180,18 +180,24 @@ To add another strategy, implement `alasin_mcp.branching.BranchCreator` and regi
 in `Services.branch_creators` under a name tenants can select.
 
 **Branch owners.** With `branch_owners = true`, only the subject that created a branch
-through this server may commit to it. `create_branch` records the caller as the owner in
-`server.state_path` before asking the creator, and the first record is never replaced:
-of two people racing to create one branch, only the first may write it, even when an
-idempotent webhook answers both with success. If creation fails, the record is dropped.
-`commit_files` refuses a branch whose owner is someone else, and a branch with no
-record at all: one created outside this server, before the setting was on, or before
-the state file was lost. Refusals never say whose a branch is. With
-`branch_creation = "webhook"`, a lost record can be restored: `create_branch` on an
-existing branch this server has no record of re-requests it from the receiver, which
-must answer 2xx only when `owner_sub` is the branch's registered owner and refuse
-(409) anyone else. With `api`, keep `state_path` on a persistent volume, or a restart
-leaves every open branch unwritable here.
+through this server may commit to it. Owners are kept in `server.state_path`.
+
+- Before creating a new branch, `create_branch` *reserves* it for the caller, so a
+  second person can't start the same creation. A reservation is never ownership:
+  nobody, the reserver included, may commit to a branch that is only reserved. Once
+  the creator answers with success, the caller is *confirmed* as the owner. If creation
+  fails, the reservation is dropped. A reservation left behind by a crash expires after
+  the creator's time limit plus a minute, and never counts in the meantime.
+- `commit_files` refuses a branch whose confirmed owner is someone else, and a branch
+  with no confirmed owner: one that is still being created, one created outside this
+  server or before the setting was on, or one whose record was lost. Refusals never say
+  whose a branch is.
+- With `branch_creation = "webhook"`, a lost record can be restored. `create_branch` on
+  an existing branch with no confirmed owner re-requests it from the receiver and
+  records nothing until it answers. The receiver must answer 2xx only when `owner_sub`
+  is the branch's registered owner, and refuse (409) anyone else. With `api`, keep
+  `state_path` on a persistent volume, or a restart leaves every open branch unwritable
+  here.
 
 ## Tenant resolver
 
@@ -254,7 +260,7 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `[auth.oauth]` | | The OAuth front door; see *OAuth sign-in*. `provider` (`origo`), `tenant` (a `service_account` tenant), `base_url` (default `server.public_url`; its host must be in `server.allowed_hosts`), `public_registration` (`false`; see the warning under *OAuth sign-in*), `allow_unauthenticated_consent` (`false`; the approve-only page, without an IdP), `auto_approve` (`false`; only with the previous), `token_ttl_seconds` (3600), `refresh_token_ttl_seconds` (30 days), `client_ttl_seconds`, `storage_path` (`/var/lib/alasin/oauth.db`; `""` = memory). |
 | `[[auth.oauth.clients]]` | | `id`, `secret_file`/`secret_env`, `redirect_uris` (exact match). Read at start-up: a new secret needs a restart. |
 | `[auth.oauth.identity_provider]` | | Per-person sign-in; see *OAuth sign-in*. `issuer` (https, exactly as in the IdP's tokens), `client_id`, `client_secret_file`/`_env` (read at start-up), `allowed_groups` (required, non-empty, exactly as emitted), `groups_claim` (`groups`; a dotted path reaches nested claims), `allowed_email_domains` (`[]`), `max_grant_age_seconds` (43200). |
-| `ALASIN_IDP_ISSUER`, `ALASIN_IDP_CLIENT_ID`, `ALASIN_IDP_CLIENT_SECRET_FILE`, `ALASIN_IDP_ALLOWED_GROUPS`, `ALASIN_IDP_GROUPS_CLAIM` | | Environment variables that set the identity provider instead of the table above (never both; `[auth.oauth]` must still be in the file). `ALASIN_IDP_ALLOWED_GROUPS` is comma-separated. |
+| `ALASIN_IDP_ISSUER`, `ALASIN_IDP_CLIENT_ID`, `ALASIN_IDP_CLIENT_SECRET_FILE`, `ALASIN_IDP_ALLOWED_GROUPS`, `ALASIN_IDP_GROUPS_CLAIM`, `ALASIN_IDP_MAX_GRANT_AGE` (seconds) | | Environment variables that set the identity provider instead of the table above (never both; `[auth.oauth]` must still be in the file). `ALASIN_IDP_ALLOWED_GROUPS` is comma-separated. |
 | `[[tenants]] id` | | Lowercase tenant ID. |
 | `forgejo_url` | | Base URL of the tenant's Forgejo. |
 | `auth_mode` | `service_account` | `service_account`, `user_delegated` or `platform_scoped`. |
@@ -302,22 +308,30 @@ verified it, the name and the groups. The MCP client is still one pre-registered
 - The principal's subject is `oauth:<issuer>|<IdP sub>`. Work sessions and branches
   belong to the person, not to the client. A token that names no person, or a person of
   another issuer, is refused.
-- The lane gate: `allowed_groups` is checked by origo at sign-in and on every refresh,
-  and again by this server on every write tool (`create_branch`, `commit_files`) against
-  the groups in the token used. Reads stay open to anyone who signed in. A write also
-  needs a name and a verified email on the token.
+- The lane gate: origo checks `allowed_groups` at sign-in, and this server checks it
+  again on every write tool (`create_branch`, `commit_files`) against the groups in the
+  token used. Reads stay open to anyone who signed in. A write also needs a name and a
+  verified email on the token, and a principal from the identity provider: a credential
+  that asserts its own groups can't write.
+- Groups are those of the sign-in. origo stores them with the grant, and a refresh
+  doesn't ask the IdP again: it only re-applies `allowed_groups` to the stored groups.
+  So a person removed from the group at the IdP keeps access until the grant reaches
+  `max_grant_age_seconds` and they must sign in again, plus at most one access-token
+  lifetime. Set both short: for example `max_grant_age_seconds = 3600` and
+  `token_ttl_seconds = 900`.
 - Commits are authored by the person (their verified name and email) and committed by
   the Forgejo service account.
 - The config refuses an inconsistent tenant: it needs `author_source = "token_claims"`
   and `branch_owners = true`, may have no `[[auth.static]]` credentials (they are
-  shared accounts), and `public_registration` can't be on.
+  shared accounts), `public_registration` can't be on, and `[auth.jwt]` can't be
+  configured at all (a JWT's tenant comes from a claim, so it could reach this tenant).
+- Commit messages can't carry `Co-authored-by` or `Signed-off-by` trailers (except the
+  configured `agent_coauthor`, which the server adds anyway): the commit is attributed to
+  the signed-in person and nobody else. This applies to every tenant.
 - Register the callback `<base_url>/authorize/callback` at the IdP as the client's
   only redirect URI. For Keycloak, add a *Group Membership* mapper with *Add to ID
   token* on, and write `allowed_groups` exactly as it emits them: `/name` with *Full
   group path* on, `name` with it off.
-- Keep `token_ttl_seconds` short (900, say): a person removed from the group keeps
-  their current access token until it expires, though every write re-checks the groups
-  it carries.
 
 **Approve-only (no identity provider).** origo then signs in nobody: whoever opens the
 authorize URL can approve, and the subject is the OAuth client, `oauth:<client id>`,

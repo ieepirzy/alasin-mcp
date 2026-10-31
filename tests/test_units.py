@@ -189,8 +189,8 @@ def test_trailers_appended() -> None:
 
 
 def test_trailers_join_an_existing_trailer_block() -> None:
-    msg = build_message("Fix\n\nSigned-off-by: A <a@example.com>", "", "t", "s")
-    assert msg == "Fix\n\nSigned-off-by: A <a@example.com>\nTrace-Id: t\nAlasin-Session: s\n"
+    msg = build_message("Fix\n\nRefs: #12", "", "t", "s")
+    assert msg == "Fix\n\nRefs: #12\nTrace-Id: t\nAlasin-Session: s\n"
 
 
 def test_coauthor_not_duplicated() -> None:
@@ -206,6 +206,23 @@ def test_coauthor_not_duplicated() -> None:
 def test_reserved_trailers_and_empty_refused(bad: str) -> None:
     with pytest.raises(InvalidInput):
         build_message(bad, "", "t", "s")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "x\n\nSigned-off-by: Someone Else <else@example.com>",
+        "x\n\nco-authored-by: Someone Else <else@example.com>",
+        "x\n\nCo-Authored-By: Claude <c@example.com>\nCo-Authored-By: Eve <e@example.com>",
+    ],
+)
+def test_attribution_trailers_refused(bad: str) -> None:
+    # The author is the signed-in person; the message can't attribute the
+    # change to anyone else. Only the configured agent co-author may appear.
+    with pytest.raises(InvalidInput, match="attributed"):
+        build_message(bad, "Claude <c@example.com>", "t", "s")
+    with pytest.raises(InvalidInput, match="attributed"):
+        build_message("x\n\nCo-Authored-By: Claude <c@example.com>", "", "t", "s")
 
 
 def test_parse_identity() -> None:

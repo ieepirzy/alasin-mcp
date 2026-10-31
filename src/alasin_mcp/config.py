@@ -351,6 +351,7 @@ IDP_ENV = {
     "ALASIN_IDP_CLIENT_SECRET_FILE": "client_secret_file",
     "ALASIN_IDP_ALLOWED_GROUPS": "allowed_groups",
     "ALASIN_IDP_GROUPS_CLAIM": "groups_claim",
+    "ALASIN_IDP_MAX_GRANT_AGE": "max_grant_age_seconds",
 }
 
 
@@ -434,6 +435,13 @@ def parse(raw: dict[str, Any], env: Mapping[str, str] | None = None) -> Config:
         )
     if oauth is not None:
         _check_oauth(oauth, tenants, server, statics)
+    if oauth is not None and oauth.identity_provider is not None and jwt is not None:
+        # A JWT's tenant comes from a claim, so any issuer behind [auth.jwt]
+        # could reach the person tenant with self-asserted groups and author.
+        raise ConfigError(
+            "[auth.jwt] can't be combined with auth.oauth.identity_provider: a JWT's tenant "
+            "comes from a claim, so its issuer could act in the person tenant"
+        )
     for c in statics:
         if c.subject.startswith(OAUTH_SUBJECT_PREFIX):
             raise ConfigError(
@@ -527,6 +535,8 @@ def _identity_provider(raw: dict[str, Any]) -> IdentityProviderConfig:
     )
     if not idp.client_id:
         raise ConfigError("auth.oauth.identity_provider needs client_id")
+    if idp.max_grant_age_seconds <= 0:
+        raise ConfigError("auth.oauth.identity_provider max_grant_age_seconds must be positive")
     if not idp.client_secret.configured:
         raise ConfigError(
             "auth.oauth.identity_provider needs client_secret_file or client_secret_env"

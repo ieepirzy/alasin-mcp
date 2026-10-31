@@ -97,6 +97,9 @@ class _OrigoVerifier:
             },
             # origo includes email only when the IdP asserted email_verified.
             email_verified=isinstance(email, str) and bool(email),
+            # The issuer is dropped: with one configured issuer the IdP's own
+            # sub is unambiguous, and it is what the sync bot records (owner_sub).
+            # The full origo sub stays in the subject.
             idp_subject=sub[len(prefix) :],
         )
 
