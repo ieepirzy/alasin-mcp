@@ -7,8 +7,15 @@ Every tool call goes through ``Services.call``, which:
    argument) and resolves the tenant from it;
 2. applies the tenant's rate limit;
 3. checks the work session belongs to this ``(tenant, subject)``;
-4. runs the tool inside a span in the work session's trace;
-5. appends one audit event, whether the call succeeded or failed.
+4. for the write tools, applies the tenant's writer gate, if it has one: the
+   caller's verified groups must include an allowed group, and the token must
+   carry a name and a verified email to author commits with;
+5. runs the tool inside a span in the work session's trace;
+6. appends one audit event, whether the call succeeded or failed.
+
+In a tenant with ``branch_owners``, ``create_branch`` records the caller as
+the branch's owner and ``commit_files`` refuses a branch it has no owner for,
+or whose owner is someone else.
 
 The tool set is fixed: reads, ``create_branch`` and ``commit_files``. There
 is no tool to merge, delete, change settings, administer or read secrets.
@@ -87,8 +94,13 @@ TOOL_NAMES = (
     "create_branch",
     "commit_files",
 )
+WRITE_TOOLS = frozenset({"create_branch", "commit_files"})
 
 RESERVED_TRAILERS = ("trace-id", "alasin-session")
+# Trailers that attribute a commit to someone. The author is the verified
+# caller; the message can't name anyone else. The configured agent co-author
+# alone may be written out (the server adds it anyway).
+ATTRIBUTION_TRAILERS = ("co-authored-by", "signed-off-by")
 MAX_DIFF_FILES = 50
 MAX_DIFF_CHARS = 200_000
 _TRAILER_LINE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*: .+$")
@@ -203,6 +215,30 @@ class Services:
     branch_creators: dict[str, BranchCreator] = field(
         default_factory=lambda: {"api": ApiBranchCreator(), "webhook": WebhookBranchCreator()}
     )
+    # Tenant id -> the groups whose members may use the write tools (the
+    # identity provider's allowed_groups). Tenants not listed have no gate.
+    writer_groups: dict[str, frozenset[str]] = field(default_factory=dict)
+
+    def check_writer(self, tenant: TenantConfig, principal: Principal) -> None:
+        """The per-write lane gate. Sign-in checked the groups once; this
+        re-checks them on every write, against the claims of this token."""
+        allowed = self.writer_groups.get(tenant.id)
+        if allowed is None:
+            return
+        # Only the identity provider's people: their groups, name and email
+        # come from the IdP, never from a credential that asserts its own.
+        if principal.idp_subject is None:
+            raise PolicyError("changes here need a sign-in through the identity provider")
+        groups = principal.claims.get("groups")
+        if not isinstance(groups, list) or not allowed.intersection(
+            g for g in groups if isinstance(g, str)
+        ):
+            raise PolicyError("your account is not in a group that may make changes here")
+        if not principal.name or not principal.email or not principal.email_verified:
+            raise PolicyError(
+                "your sign-in carries no name or no verified email to author commits with; "
+                "ask an administrator to set them on your account, then sign in again"
+            )
 
     def branch_creator(self, tenant: TenantConfig) -> BranchCreator:
         creator = self.branch_creators.get(tenant.branch_creation)
@@ -249,6 +285,12 @@ class Services:
                 msg = "unknown or expired session_id; call begin_change first"
                 self._finish(event, None, error=msg)
                 raise ToolError(msg)
+        if tool in WRITE_TOOLS:
+            try:
+                self.check_writer(tenant, principal)
+            except PolicyError as e:
+                self._finish(event, None, error=str(e))
+                raise ToolError(str(e)) from None
         session_trace = (session.trace_id, session.span_id) if session else None
         attrs = {
             "alasin.tenant": tenant.id,
@@ -394,6 +436,72 @@ async def check_writable(
         raise PolicyError(f"branch '{branch}' is protected in Forgejo (no push allowed)")
 
 
+# How long a pending reservation holds beyond the creator's own time limit
+# (the webhook's request timeout plus its polling). Older, it is dropped.
+RESERVATION_MARGIN = 60.0
+
+
+def reservation_ttl(tenant: TenantConfig) -> float:
+    hook = tenant.branch_webhook
+    return (hook.timeout_seconds + 15.0 if hook is not None else 30.0) + RESERVATION_MARGIN
+
+
+def reserve_branch(call: Call, repo: RepoRef, branch: str) -> None:
+    """Reserve a new branch for the caller before it is created.
+
+    Pending only: it keeps a second person from starting the same creation but
+    is never ownership. confirm_owner makes it so once the creator succeeds.
+    """
+    if not call.tenant.branch_owners:
+        return
+    holder = call.services.store.reserve_branch(
+        call.tenant.id,
+        repo.full_name,
+        branch,
+        call.principal.subject,
+        reservation_ttl(call.tenant),
+    )
+    if holder != call.principal.subject:
+        # Never say who: an echo would tell anyone which branches whose are.
+        raise PolicyError(f"branch '{branch}' is already taken; choose another name")
+
+
+def confirm_owner(call: Call, repo: RepoRef, branch: str) -> None:
+    if call.tenant.branch_owners:
+        call.services.store.confirm_branch(
+            call.tenant.id, repo.full_name, branch, call.principal.subject
+        )
+
+
+def may_reclaim(call: Call, repo: RepoRef, branch: str) -> bool:
+    """Whether create_branch may re-request a branch that already exists.
+
+    Only where the branch webhook is the owner's authority and this server has
+    no confirmed owner (its state was lost, say). The receiver answers a
+    re-request by the branch's owner with success and anyone else with a
+    refusal. Nothing is recorded before that answer, so the branch has no
+    owner here, and takes no writes, until the receiver has named the caller.
+    """
+    return (
+        call.tenant.branch_owners
+        and call.tenant.branch_creation == "webhook"
+        and call.services.store.branch_owner(call.tenant.id, repo.full_name, branch) is None
+    )
+
+
+def check_owner(call: Call, repo: RepoRef, branch: str) -> None:
+    """In a branch_owners tenant, only the branch's recorded creator may write it."""
+    if not call.tenant.branch_owners:
+        return
+    owner = call.services.store.branch_owner(call.tenant.id, repo.full_name, branch)
+    if owner != call.principal.subject:
+        raise PolicyError(
+            f"branch '{branch}' was not created by you through this server; "
+            "create your own branch with create_branch and commit there (if you did create "
+            "it, call create_branch for it again to confirm)"
+        )
+
+
 def parse_identity(value: str) -> Identity | None:
     m = _IDENTITY.match(value)
     return Identity(m.group(1), m.group(2)) if m else None
@@ -459,9 +567,19 @@ def build_message(message: str, coauthor: str, trace_id: str, session_id: str) -
     if len(text) > 10_000:
         raise InvalidInput("commit message is too long")
     for line in text.splitlines():
-        key = line.split(":", 1)[0].strip().casefold()
-        if ":" in line and key in RESERVED_TRAILERS:
-            raise InvalidInput(f"the server adds the '{line.split(':', 1)[0]}' trailer itself")
+        if ":" not in line:
+            continue
+        name, _, value = line.partition(":")
+        key = name.strip().casefold()
+        if key in RESERVED_TRAILERS:
+            raise InvalidInput(f"the server adds the '{name.strip()}' trailer itself")
+        if key in ATTRIBUTION_TRAILERS and not (
+            key == "co-authored-by" and value.strip().casefold() == coauthor.casefold()
+        ):
+            raise InvalidInput(
+                f"the '{name.strip()}' trailer can't be set: the commit is attributed to the "
+                "signed-in person by the server"
+            )
     trailers = []
     if coauthor and f"co-authored-by: {coauthor}".casefold() not in text.casefold():
         trailers.append(f"Co-Authored-By: {coauthor}")
@@ -762,7 +880,8 @@ def build_server(services: Services) -> MCPServer:
             async with call.client(cred) as client:
                 info = await call.repo_info(client, r)
                 await check_writable(call, client, r, name, info)
-                if await client.branch(r, name) is not None:
+                exists = await client.branch(r, name) is not None
+                if exists and not may_reclaim(call, r, name):
                     raise PolicyError(f"branch '{name}' already exists")
                 source = validation.ref(from_ref) if from_ref else str(info["default_branch"])
                 creator = call.services.branch_creator(call.tenant)
@@ -773,17 +892,27 @@ def build_server(services: Services) -> MCPServer:
                     method=call.tenant.branch_creation,
                 )
                 assert call.session is not None
-                sha = await creator.create(
-                    BranchRequest(
-                        call.tenant,
-                        call.principal,
-                        call.session.session_id,
-                        canonical_repo(r, info),
-                        name,
-                        source,
-                    ),
-                    client,
-                )
+                if not exists:
+                    reserve_branch(call, r, name)
+                try:
+                    sha = await creator.create(
+                        BranchRequest(
+                            call.tenant,
+                            call.principal,
+                            call.session.session_id,
+                            canonical_repo(r, info),
+                            name,
+                            source,
+                        ),
+                        client,
+                    )
+                except BaseException:
+                    if call.tenant.branch_owners:
+                        call.services.store.release_branch(
+                            call.tenant.id, r.full_name, name, call.principal.subject
+                        )
+                    raise
+                confirm_owner(call, r, name)
             call.audit["commit"] = sha
             return {"branch": name, "from": source, "commit": sha}
 
@@ -846,6 +975,7 @@ def build_server(services: Services) -> MCPServer:
                 await check_writable(call, client, r, name, info)
                 if await client.branch(r, name) is None:
                     raise PolicyError(f"branch '{name}' does not exist; create_branch first")
+                check_owner(call, r, name)
                 ops: list[dict[str, Any]] = []
                 for p, data in decoded:
                     try:

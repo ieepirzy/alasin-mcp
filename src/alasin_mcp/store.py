@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Durable state: work sessions, delegated tokens and OAuth flow state (SQLite).
+"""Durable state: work sessions, delegated tokens, OAuth flow state and branch
+owners (SQLite).
 
 Isolation rules this module enforces:
 
@@ -58,6 +59,17 @@ CREATE TABLE IF NOT EXISTS oauth_states (
     verifier TEXT NOT NULL,
     match_value TEXT NOT NULL,
     expires_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS branch_owners (
+    tenant TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    -- NULL while pending: reserved, the creator has not answered yet. Only a
+    -- confirmed row is ownership.
+    confirmed_at REAL,
+    PRIMARY KEY (tenant, repo, branch)
 );
 """
 
@@ -244,3 +256,64 @@ class Store:
         if not rows or rows[0][4] < time.time():
             return None
         return OAuthState(*rows[0][:4])
+
+    # -- branch owners (tenants with branch_owners = true) ------------------------
+    #
+    # A row is pending from reserve_branch until confirm_branch, when the branch
+    # creator has answered with success. A pending row is never ownership: it
+    # only keeps a second person from starting the same creation, and once older
+    # than ``stale_after`` it is dropped, so a crash between the two leaves no
+    # owner behind.
+
+    def reserve_branch(
+        self, tenant: str, repo: str, branch: str, subject: str, stale_after: float
+    ) -> str:
+        """Reserve a branch about to be created; return who holds it: the
+        confirmed owner, else the live pending reservation's subject
+        (``subject`` itself when this call made or already held it)."""
+        key = (tenant, repo.casefold(), branch)
+        now = time.time()
+        with self._lock:
+            self._db.execute(
+                "DELETE FROM branch_owners WHERE tenant = ? AND repo = ? AND branch = ?"
+                " AND confirmed_at IS NULL AND created_at < ?",
+                (*key, now - stale_after),
+            )
+            self._db.execute(
+                "INSERT OR IGNORE INTO branch_owners VALUES (?, ?, ?, ?, ?, NULL)",
+                (*key, subject, now),
+            )
+            rows = self._db.execute(
+                "SELECT subject FROM branch_owners WHERE tenant = ? AND repo = ? AND branch = ?",
+                key,
+            ).fetchall()
+        return rows[0][0]
+
+    def confirm_branch(self, tenant: str, repo: str, branch: str, subject: str) -> None:
+        """Record ``subject`` as the owner: the branch creator said it is.
+
+        Replaces whatever row was there. The creator is the authority: a
+        webhook receiver answers success only to the branch's registered owner,
+        and Forgejo creates a branch for one caller only.
+        """
+        self._q(
+            "INSERT OR REPLACE INTO branch_owners VALUES (?, ?, ?, ?, ?, ?)",
+            (tenant, repo.casefold(), branch, subject, time.time(), time.time()),
+        )
+
+    def release_branch(self, tenant: str, repo: str, branch: str, subject: str) -> None:
+        """Drop ``subject``'s pending reservation; a confirmed owner stays."""
+        self._q(
+            "DELETE FROM branch_owners WHERE tenant = ? AND repo = ? AND branch = ?"
+            " AND subject = ? AND confirmed_at IS NULL",
+            (tenant, repo.casefold(), branch, subject),
+        )
+
+    def branch_owner(self, tenant: str, repo: str, branch: str) -> str | None:
+        """The confirmed owner, or None. A pending reservation is not an owner."""
+        rows = self._q(
+            "SELECT subject FROM branch_owners WHERE tenant = ? AND repo = ? AND branch = ?"
+            " AND confirmed_at IS NOT NULL",
+            (tenant, repo.casefold(), branch),
+        )
+        return rows[0][0] if rows else None

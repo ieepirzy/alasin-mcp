@@ -23,7 +23,10 @@ dependencies = [
 [project.optional-dependencies]
 # The in-process OAuth front door ([auth.oauth] provider = "origo"). Optional:
 # deployments that authenticate with static bearers or JWTs never load it.
-origo = ["origo==0.3.0"]
+# Pinned to origo main at the upstream-sign-in merge (origo#145, version 0.4.0)
+# until 0.4.0 is on PyPI; then back to "origo==0.4.0". A tarball URL, not
+# git+https, so the image needs no git; uv.lock records its hash.
+origo = ["origo @ https://github.com/ieepirzy/origo/archive/6fa218f383fad01826d2df5025ab4aebd0621774.tar.gz"]
 
 [project.scripts]
 alasin-mcp = "alasin_mcp.app:main"
@@ -34,6 +37,10 @@ Source = "https://github.com/ieepirzy/alasin-mcp"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# For the origo tarball pin above; drop with it.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/alasin_mcp"]

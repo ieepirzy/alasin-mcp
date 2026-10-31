@@ -34,19 +34,29 @@ gateway = true
 # tenant_claim = "tenant"
 
 # Or let MCP clients (e.g. a claude.ai connector) sign in here over OAuth 2.1 +
-# PKCE. Needs the origo extra. Static credentials above keep working beside it.
+# PKCE, each person through your OIDC provider. Needs the origo extra.
 # [auth.oauth]
 # provider = "origo"
 # tenant = "default"
 # base_url = "https://alasin.example.com"   # default: server.public_url
 # storage_path = "/var/lib/alasin/oauth.db" # "" keeps tokens in memory
+# token_ttl_seconds = 900
 # The tenant must be service_account, and base_url's host must be in
-# server.allowed_hosts. Never public_registration on an open network: origo
-# checks no user, so anyone could register a client (see README).
+# server.allowed_hosts. Never public_registration on an open network (see README).
 # [[auth.oauth.clients]]
 # id = "claude-connector"
 # secret_file = "/run/secrets/alasin_oauth_client_secret"
 # redirect_uris = ["https://claude.ai/api/mcp/auth_callback"]
+#
+# People sign in at the IdP; its redirect URI is <base_url>/authorize/callback.
+# The tenant then needs author_source = "token_claims", branch_owners = true and
+# no [[auth.static]] credentials (see README, "Per-person sign-in").
+# [auth.oauth.identity_provider]
+# issuer = "https://idp.example.com/realms/example"
+# client_id = "alasin-mcp"
+# client_secret_file = "/run/secrets/alasin_idp_client_secret"
+# allowed_groups = ["/forgejo-lane"]   # exactly as the IdP emits them
+# groups_claim = "groups"
 
 [[tenants]]
 id = "default"
@@ -62,6 +72,8 @@ branch_prefix = ""
 author_source = "service_account"
 agent_coauthor = "Claude <noreply@anthropic.com>"
 rate_limit_per_minute = 120
+# Only a branch's creator may commit to it (required with an identity provider):
+# branch_owners = true
 # CI workflow folders (.forgejo/, .gitea/, .github/) are refused unless:
 # allow_ci_paths = true
 

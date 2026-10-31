@@ -7,8 +7,9 @@ An agent can read repositories, create a work branch and commit several files to
 one commit. It can't merge, delete, change settings or touch secrets: a person reviews
 and merges the branch. *Alasin* is Finnish for "anvil".
 
-- **Transport:** Streamable HTTP (stateless) at `/mcp`. Designed to sit behind an OAuth
-  gateway that forwards a bearer token, or to verify JWTs from your identity provider.
+- **Transport:** Streamable HTTP (stateless) at `/mcp`. People sign in through its OAuth
+  front door (origo, with your OIDC provider upstream); it can also sit behind an OAuth
+  gateway that forwards a bearer token, or verify JWTs from your identity provider.
 - **Multi-tenant:** one deployment serves many tenants, each with its own Forgejo. The
   tenant comes only from the verified token.
 - **Audited and traced:** every tool call is an OpenTelemetry span and an append-only
@@ -120,8 +121,9 @@ Chosen per tenant with `auth_mode`.
 `author_source` lets the deployer choose a trusted source for the author; the committer
 stays the service account and the audit records both:
 
-- `token_claims`: `name` and `email` from the verified inbound token (JWT verifier). The
-  token must carry `email_verified: true`.
+- `token_claims`: `name` and `email` from the verified inbound token (JWT verifier, or
+  the OAuth front door's identity provider). The token must carry `email_verified: true`
+  (origo includes the email only when the IdP verified it).
 - `trusted_header`: a `Name <email>` header named by `author_header`. It is honoured only
   from callers that authenticated with an `[[auth.static]]` credential marked
   `gateway = true`; any other caller sending it is refused, and the config won't load
@@ -162,7 +164,10 @@ Chosen per tenant with `branch_creation`:
 - `api` (default): the server's Forgejo account creates the branch.
 - `webhook`: for setups where another service must create branches. The server sends
   `POST <branch_webhook.url>` with the JSON body
-  `{"tenant", "repo", "branch", "from_ref", "session_id", "subject"}` and these headers:
+  `{"tenant", "repo", "branch", "from_ref", "session_id", "subject"}`, plus `owner_sub`
+  when the caller signed in through the identity provider (see *OAuth sign-in*): the
+  person's own subject at the IdP, for Keycloak the user ID, without origo's
+  `<issuer>|` prefix. The headers:
   - `X-Alasin-Timestamp`: Unix seconds.
   - `X-Alasin-Signature`: `sha256=` followed by the hex HMAC-SHA256 of
     `"<timestamp>." + body`, keyed with the tenant's webhook secret.
@@ -173,6 +178,26 @@ Chosen per tenant with `branch_creation`:
 
 To add another strategy, implement `alasin_mcp.branching.BranchCreator` and register it
 in `Services.branch_creators` under a name tenants can select.
+
+**Branch owners.** With `branch_owners = true`, only the subject that created a branch
+through this server may commit to it. Owners are kept in `server.state_path`.
+
+- Before creating a new branch, `create_branch` *reserves* it for the caller, so a
+  second person can't start the same creation. A reservation is never ownership:
+  nobody, the reserver included, may commit to a branch that is only reserved. Once
+  the creator answers with success, the caller is *confirmed* as the owner. If creation
+  fails, the reservation is dropped. A reservation left behind by a crash expires after
+  the creator's time limit plus a minute, and never counts in the meantime.
+- `commit_files` refuses a branch whose confirmed owner is someone else, and a branch
+  with no confirmed owner: one that is still being created, one created outside this
+  server or before the setting was on, or one whose record was lost. Refusals never say
+  whose a branch is.
+- With `branch_creation = "webhook"`, a lost record can be restored. `create_branch` on
+  an existing branch with no confirmed owner re-requests it from the receiver and
+  records nothing until it answers. The receiver must answer 2xx only when `owner_sub`
+  is the branch's registered owner, and refuse (409) anyone else. With `api`, keep
+  `state_path` on a persistent volume, or a restart leaves every open branch unwritable
+  here.
 
 ## Tenant resolver
 
@@ -232,8 +257,10 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `server.max_request_bytes` | 8 MiB | Largest request body, checked before authentication. |
 | `[[auth.static]]` | | `token_file`/`token_env`, `tenant`, `subject`, `gateway` (may send the trusted author header). Re-read every 30 s, so rotation needs no restart; list two entries to overlap old and new. The Forgejo service token is re-read on every call. |
 | `[auth.jwt]` | | `jwks_url`, `issuer`, `audience`, `algorithms`, `tenant_claim`, `subject_claim`, `name_claim`, `email_claim`, `default_tenant`. |
-| `[auth.oauth]` | | The OAuth front door; see *OAuth sign-in*. `provider` (`origo`), `tenant` (a `service_account` tenant), `base_url` (default `server.public_url`; its host must be in `server.allowed_hosts`), `public_registration` (`false`; see the warning under *OAuth sign-in*), `auto_approve` (`false`), `token_ttl_seconds` (3600), `refresh_token_ttl_seconds` (30 days), `client_ttl_seconds`, `storage_path` (`/var/lib/alasin/oauth.db`; `""` = memory). |
+| `[auth.oauth]` | | The OAuth front door; see *OAuth sign-in*. `provider` (`origo`), `tenant` (a `service_account` tenant), `base_url` (default `server.public_url`; its host must be in `server.allowed_hosts`), `public_registration` (`false`; see the warning under *OAuth sign-in*), `allow_unauthenticated_consent` (`false`; the approve-only page, without an IdP), `auto_approve` (`false`; only with the previous), `token_ttl_seconds` (3600), `refresh_token_ttl_seconds` (30 days), `client_ttl_seconds`, `storage_path` (`/var/lib/alasin/oauth.db`; `""` = memory). |
 | `[[auth.oauth.clients]]` | | `id`, `secret_file`/`secret_env`, `redirect_uris` (exact match). Read at start-up: a new secret needs a restart. |
+| `[auth.oauth.identity_provider]` | | Per-person sign-in; see *OAuth sign-in*. `issuer` (https, exactly as in the IdP's tokens), `client_id`, `client_secret_file`/`_env` (read at start-up), `allowed_groups` (required, non-empty, exactly as emitted), `groups_claim` (`groups`; a dotted path reaches nested claims), `allowed_email_domains` (`[]`), `max_grant_age_seconds` (43200). |
+| `ALASIN_IDP_ISSUER`, `ALASIN_IDP_CLIENT_ID`, `ALASIN_IDP_CLIENT_SECRET_FILE`, `ALASIN_IDP_ALLOWED_GROUPS`, `ALASIN_IDP_GROUPS_CLAIM`, `ALASIN_IDP_MAX_GRANT_AGE` (seconds) | | Environment variables that set the identity provider instead of the table above (never both; `[auth.oauth]` must still be in the file). `ALASIN_IDP_ALLOWED_GROUPS` is comma-separated. |
 | `[[tenants]] id` | | Lowercase tenant ID. |
 | `forgejo_url` | | Base URL of the tenant's Forgejo. |
 | `auth_mode` | `service_account` | `service_account`, `user_delegated` or `platform_scoped`. |
@@ -250,6 +277,7 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `allow_ci_paths`, `ci_paths` | `false`, `.forgejo/`, `.gitea/`, `.github/` | CI workflow folders; see *Security model*. |
 | `branch_creation` | `api` | `api`, `webhook`, or a registered name; see *Branch creation*. |
 | `[tenants.branch_webhook]` | | `url`, `secret_file`/`secret_env`, `timeout_seconds` (60), `poll_interval_seconds` (2). |
+| `branch_owners` | `false` | Only a branch's creator may commit to it; see *Branch creation*. |
 
 ## OAuth sign-in
 
@@ -261,19 +289,56 @@ includes it).
 
 - A request to `/mcp` without a valid token gets a 401 whose `WWW-Authenticate` names the
   protected-resource metadata, so the client can discover where to sign in.
-- The discovery and sign-in routes (`/.well-known/...`, `/authorize`, `/token`,
-  `/register`, `/userinfo`) are public; each checks its own credentials.
-- Every token from the front door belongs to the one `tenant` configured. Its subject is
-  `oauth:<client id>`: the OAuth client, not a person. origo has no user accounts, so
-  everyone who signs in through one client shares its work sessions. For that reason the
-  tenant must use `auth_mode = "service_account"`; a `user_delegated` or
-  `platform_scoped` tenant is refused, since it would share per-person Forgejo tokens.
+- The discovery and sign-in routes (`/.well-known/...`, `/authorize`,
+  `/authorize/callback`, `/token`, `/register`, `/userinfo`) are public; each checks its
+  own credentials.
+- Every token from the front door belongs to the one `tenant` configured, which must use
+  `auth_mode = "service_account"`.
 - The `oauth:` subject prefix is reserved: an `[[auth.static]]` subject using it is
   refused, and a JWT whose subject starts with it is rejected.
 - The `base_url` host must be listed in `server.allowed_hosts`, so the DNS-rebinding
   check covers the host clients sign in at.
-- `[[auth.static]]` and `[auth.jwt]` keep working beside it on the same `/mcp`, so a
-  machine caller (a tool registry listing tools, say) can keep a static bearer.
+
+**Per-person sign-in (`[auth.oauth.identity_provider]`).** origo sends each person to
+the upstream OpenID Connect provider (Keycloak, say) to sign in, and its tokens then
+carry that person: origo's `sub` (`<issuer>|<IdP sub>`), the email only if the IdP
+verified it, the name and the groups. The MCP client is still one pre-registered
+`[[auth.oauth.clients]]` entry, such as a claude.ai connector.
+
+- The principal's subject is `oauth:<issuer>|<IdP sub>`. Work sessions and branches
+  belong to the person, not to the client. A token that names no person, or a person of
+  another issuer, is refused.
+- The lane gate: origo checks `allowed_groups` at sign-in, and this server checks it
+  again on every write tool (`create_branch`, `commit_files`) against the groups in the
+  token used. Reads stay open to anyone who signed in. A write also needs a name and a
+  verified email on the token, and a principal from the identity provider: a credential
+  that asserts its own groups can't write.
+- Groups are those of the sign-in. origo stores them with the grant, and a refresh
+  doesn't ask the IdP again: it only re-applies `allowed_groups` to the stored groups.
+  So a person removed from the group at the IdP keeps access until the grant reaches
+  `max_grant_age_seconds` and they must sign in again, plus at most one access-token
+  lifetime. Set both short: for example `max_grant_age_seconds = 3600` and
+  `token_ttl_seconds = 900`.
+- Commits are authored by the person (their verified name and email) and committed by
+  the Forgejo service account.
+- The config refuses an inconsistent tenant: it needs `author_source = "token_claims"`
+  and `branch_owners = true`, may have no `[[auth.static]]` credentials (they are
+  shared accounts), `public_registration` can't be on, and `[auth.jwt]` can't be
+  configured at all (a JWT's tenant comes from a claim, so it could reach this tenant).
+- Commit messages can't carry `Co-authored-by` or `Signed-off-by` trailers (except the
+  configured `agent_coauthor`, which the server adds anyway): the commit is attributed to
+  the signed-in person and nobody else. This applies to every tenant.
+- Register the callback `<base_url>/authorize/callback` at the IdP as the client's
+  only redirect URI. For Keycloak, add a *Group Membership* mapper with *Add to ID
+  token* on, and write `allowed_groups` exactly as it emits them: `/name` with *Full
+  group path* on, `name` with it off.
+
+**Approve-only (no identity provider).** origo then signs in nobody: whoever opens the
+authorize URL can approve, and the subject is the OAuth client, `oauth:<client id>`,
+shared by everyone who signs in through it. origo refuses every authorization in this
+mode unless `allow_unauthenticated_consent = true`. The setting is passed to origo
+explicitly, so its `ORIGO_ALLOW_UNAUTHENTICATED_CONSENT` environment variable has no
+effect here. `[[auth.static]]` and `[auth.jwt]` work beside it on the same `/mcp`.
 
 > **Warning: `public_registration` lets anyone on the internet connect.** With it on, any
 > client that can reach this server registers itself at `/register` and gets a token for

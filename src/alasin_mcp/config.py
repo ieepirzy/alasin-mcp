@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -28,8 +29,9 @@ class ConfigError(ValueError):
     pass
 
 
-# Subjects of OAuth front-door principals start with this (oauth.py). No other
-# credential may claim it, so an OAuth client never shares sessions with one.
+# Subjects of OAuth front-door principals (a person or a client, oauth.py)
+# start with this. No other credential may claim it, so a front-door principal
+# never shares sessions or branches with one.
 OAUTH_SUBJECT_PREFIX = "oauth:"
 # public_registration lets anyone who can reach the server register a client
 # and get a token for the tenant: origo has no user accounts. Opting in takes
@@ -133,6 +135,11 @@ class TenantConfig:
     # registered in Services.branch_creators.
     branch_creation: str = "api"
     branch_webhook: BranchWebhookConfig | None = None
+    # Only the subject that created a branch through this server may commit to
+    # it. The owner is recorded in server.state_path at create_branch; a
+    # branch with no record (made elsewhere, or before the state was lost) is
+    # refused. Required for a tenant whose people sign in through an IdP.
+    branch_owners: bool = False
 
     @property
     def api_base(self) -> str:
@@ -176,6 +183,21 @@ class OAuthClientConfig:
 
 
 @dataclass(frozen=True)
+class IdentityProviderConfig:
+    """An upstream OIDC provider people sign in with (origo's IdentityProvider)."""
+
+    issuer: str
+    client_id: str
+    client_secret: SecretRef
+    # The lane gate: at least one must appear in the person's groups, checked
+    # at sign-in (origo) and again on every write tool.
+    allowed_groups: tuple[str, ...]
+    groups_claim: str = "groups"
+    allowed_email_domains: tuple[str, ...] = ()
+    max_grant_age_seconds: int = 12 * 3600
+
+
+@dataclass(frozen=True)
 class OAuthServerConfig:
     """The OAuth front door MCP clients sign in through (see oauth.py)."""
 
@@ -189,6 +211,13 @@ class OAuthServerConfig:
     token_ttl_seconds: int = 3600
     refresh_token_ttl_seconds: int = 30 * 24 * 3600
     client_ttl_seconds: int | None = None
+    # People sign in at this IdP; each token then names a person, not a client.
+    identity_provider: IdentityProviderConfig | None = None
+    # Without an IdP, origo refuses every authorization unless this is on (it
+    # serves an approve-only consent page that authenticates nobody). Passed to
+    # origo explicitly, so its ORIGO_ALLOW_UNAUTHENTICATED_CONSENT env var
+    # can't switch it on behind the config's back.
+    allow_unauthenticated_consent: bool = False
     # SQLite file for tokens and registered clients; empty keeps them in
     # memory, so every client signs in again after a restart.
     storage_path: str = "/var/lib/alasin/oauth.db"
@@ -304,6 +333,7 @@ def _tenant(raw: dict[str, Any]) -> TenantConfig:
         platform=platform,
         branch_creation=creation,
         branch_webhook=webhook,
+        branch_owners=bool(raw.get("branch_owners", False)),
     )
     if mode is AuthMode.SERVICE_ACCOUNT and not tenant.service_token.configured:
         raise ConfigError(f"tenant {tid}: service_account mode needs service_token_file/_env")
@@ -312,7 +342,34 @@ def _tenant(raw: dict[str, Any]) -> TenantConfig:
     return tenant
 
 
-def parse(raw: dict[str, Any]) -> Config:
+# The identity provider may come from the environment instead of the file, so
+# a deployment sets it beside the secret mount it names. Either source, never
+# both. ALASIN_IDP_ALLOWED_GROUPS is comma-separated.
+IDP_ENV = {
+    "ALASIN_IDP_ISSUER": "issuer",
+    "ALASIN_IDP_CLIENT_ID": "client_id",
+    "ALASIN_IDP_CLIENT_SECRET_FILE": "client_secret_file",
+    "ALASIN_IDP_ALLOWED_GROUPS": "allowed_groups",
+    "ALASIN_IDP_GROUPS_CLAIM": "groups_claim",
+    "ALASIN_IDP_MAX_GRANT_AGE": "max_grant_age_seconds",
+}
+
+
+def _idp_from_env(env: Mapping[str, str]) -> dict[str, Any] | None:
+    raw: dict[str, Any] = {}
+    for name, key in IDP_ENV.items():
+        value = env.get(name, "").strip()
+        if not value:
+            continue
+        if key == "allowed_groups":
+            raw[key] = [g.strip() for g in value.split(",") if g.strip()]
+        else:
+            raw[key] = value
+    return raw or None
+
+
+def parse(raw: dict[str, Any], env: Mapping[str, str] | None = None) -> Config:
+    """``env`` (default ``os.environ``) supplies the ``ALASIN_IDP_*`` settings."""
     s = raw.get("server", {})
     server = ServerConfig(
         host=str(s.get("host", ServerConfig.host)),
@@ -361,13 +418,30 @@ def parse(raw: dict[str, Any]) -> Config:
             email_claim=str(j.get("email_claim", "email")),
             default_tenant=str(j.get("default_tenant", "")),
         )
+    idp_env = _idp_from_env(os.environ if env is None else env)
+    if idp_env is not None:
+        if "oauth" not in auth:
+            raise ConfigError("ALASIN_IDP_* is set but there is no [auth.oauth] to sign in through")
+        if "identity_provider" in auth["oauth"]:
+            raise ConfigError(
+                "the identity provider is set both in [auth.oauth.identity_provider] and in "
+                "ALASIN_IDP_*; use one"
+            )
+        auth = {**auth, "oauth": {**auth["oauth"], "identity_provider": idp_env}}
     oauth = _oauth_server(auth["oauth"], server) if "oauth" in auth else None
     if not statics and jwt is None and oauth is None:
         raise ConfigError(
             "no inbound auth configured: add [[auth.static]], [auth.jwt] or [auth.oauth]"
         )
     if oauth is not None:
-        _check_oauth(oauth, tenants, server)
+        _check_oauth(oauth, tenants, server, statics)
+    if oauth is not None and oauth.identity_provider is not None and jwt is not None:
+        # A JWT's tenant comes from a claim, so any issuer behind [auth.jwt]
+        # could reach the person tenant with self-asserted groups and author.
+        raise ConfigError(
+            "[auth.jwt] can't be combined with auth.oauth.identity_provider: a JWT's tenant "
+            "comes from a claim, so its issuer could act in the person tenant"
+        )
     for c in statics:
         if c.subject.startswith(OAUTH_SUBJECT_PREFIX):
             raise ConfigError(
@@ -412,6 +486,12 @@ def _oauth_server(raw: dict[str, Any], server: ServerConfig) -> OAuthServerConfi
     if not clients and not public:
         raise ConfigError("auth.oauth: add [[auth.oauth.clients]] or set public_registration")
     client_ttl = raw.get("client_ttl_seconds")
+    idp = _identity_provider(raw["identity_provider"]) if "identity_provider" in raw else None
+    if idp is not None and public:
+        raise ConfigError(
+            "auth.oauth: public_registration can't be combined with identity_provider; "
+            "list the clients under [[auth.oauth.clients]]"
+        )
     return OAuthServerConfig(
         tenant=validation.tenant_id(str(raw["tenant"])),
         provider=str(raw.get("provider", "origo")),
@@ -422,28 +502,86 @@ def _oauth_server(raw: dict[str, Any], server: ServerConfig) -> OAuthServerConfi
         token_ttl_seconds=int(raw.get("token_ttl_seconds", 3600)),
         refresh_token_ttl_seconds=int(raw.get("refresh_token_ttl_seconds", 30 * 24 * 3600)),
         client_ttl_seconds=int(client_ttl) if client_ttl is not None else None,
+        identity_provider=idp,
+        allow_unauthenticated_consent=raw.get("allow_unauthenticated_consent") is True,
         storage_path=str(raw.get("storage_path", OAuthServerConfig.storage_path)),
     )
 
 
+def _identity_provider(raw: dict[str, Any]) -> IdentityProviderConfig:
+    issuer = str(raw.get("issuer", ""))
+    if not issuer.startswith("https://"):
+        raise ConfigError("auth.oauth.identity_provider needs an https issuer")
+    groups = raw.get("allowed_groups")
+    # Written out, never defaulted: Keycloak emits "/name" or "name" depending
+    # on its mapper's "Full group path" setting, and a mismatch locks out all.
+    if (
+        not isinstance(groups, list)
+        or not groups
+        or not all(isinstance(g, str) and g for g in groups)
+    ):
+        raise ConfigError(
+            "auth.oauth.identity_provider needs allowed_groups, a non-empty list of the "
+            "group names exactly as the IdP emits them"
+        )
+    idp = IdentityProviderConfig(
+        issuer=issuer,
+        client_id=str(raw.get("client_id", "")),
+        client_secret=_secret(raw, "client_secret"),
+        allowed_groups=tuple(groups),
+        groups_claim=str(raw.get("groups_claim", "groups")),
+        allowed_email_domains=tuple(str(d) for d in raw.get("allowed_email_domains", ())),
+        max_grant_age_seconds=int(raw.get("max_grant_age_seconds", 12 * 3600)),
+    )
+    if not idp.client_id:
+        raise ConfigError("auth.oauth.identity_provider needs client_id")
+    if idp.max_grant_age_seconds <= 0:
+        raise ConfigError("auth.oauth.identity_provider max_grant_age_seconds must be positive")
+    if not idp.client_secret.configured:
+        raise ConfigError(
+            "auth.oauth.identity_provider needs client_secret_file or client_secret_env"
+        )
+    return idp
+
+
 def _check_oauth(
-    oauth: OAuthServerConfig, tenants: tuple[TenantConfig, ...], server: ServerConfig
+    oauth: OAuthServerConfig,
+    tenants: tuple[TenantConfig, ...],
+    server: ServerConfig,
+    statics: tuple[StaticCredential, ...] = (),
 ) -> None:
     tenant = next((t for t in tenants if t.id == oauth.tenant), None)
     if tenant is None:
         raise ConfigError(f"auth.oauth for unknown tenant {oauth.tenant!r}")
-    # One subject per OAuth client, not per person: every user of a connector
-    # would share its work sessions and, in these modes, its Forgejo tokens.
+    # Without an IdP the subject is the OAuth client, shared by every person
+    # who signs in through it; and with one, the Forgejo credential is still
+    # the service account's (the person is the commit author, not the token).
     if tenant.auth_mode is not AuthMode.SERVICE_ACCOUNT:
-        raise ConfigError(
-            f"auth.oauth tenant {tenant.id!r} must use auth_mode = service_account: "
-            "OAuth principals are per client, not per person"
-        )
+        raise ConfigError(f"auth.oauth tenant {tenant.id!r} must use auth_mode = service_account")
     # Clients sign in through a browser at base_url, so its host must also be
     # covered by the DNS-rebinding check.
     host = urlsplit(oauth.base_url).netloc
     if host not in server.allowed_hosts:
         raise ConfigError(f"auth.oauth: add the base_url host {host!r} to server.allowed_hosts")
+    if oauth.identity_provider is None:
+        return
+    # Each person signs in as themselves: no shared account in this tenant,
+    # each commit authored by the person, each branch writable by its creator.
+    if tenant.author_source is not AuthorSource.TOKEN_CLAIMS:
+        raise ConfigError(
+            f"tenant {tenant.id}: with auth.oauth.identity_provider, set "
+            'author_source = "token_claims" so each commit is authored by the person'
+        )
+    if not tenant.branch_owners:
+        raise ConfigError(
+            f"tenant {tenant.id}: with auth.oauth.identity_provider, set branch_owners = true "
+            "so only a branch's creator may write it"
+        )
+    if any(c.tenant == tenant.id for c in statics):
+        raise ConfigError(
+            f"tenant {tenant.id}: [[auth.static]] credentials are shared accounts; remove them "
+            "from a tenant whose people sign in through auth.oauth.identity_provider"
+        )
 
 
 def load(path: str | os.PathLike[str]) -> Config:
