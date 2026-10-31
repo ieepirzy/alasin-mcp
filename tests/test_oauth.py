@@ -46,6 +46,9 @@ def _oauth_cfg(**kw: Any) -> OAuthServerConfig:
         tenant="t",
         clients=(OAuthClientConfig(CLIENT, SecretRef(env="TEST_OAUTH"), (REDIRECT,)),),
         auto_approve=True,
+        # The approve-only page these tests drive; per-person sign-in is in
+        # test_people.py.
+        allow_unauthenticated_consent=True,
         storage_path="",
         **kw,
     )

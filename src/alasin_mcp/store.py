@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Durable state: work sessions, delegated tokens and OAuth flow state (SQLite).
+"""Durable state: work sessions, delegated tokens, OAuth flow state and branch
+owners (SQLite).
 
 Isolation rules this module enforces:
 
@@ -58,6 +59,14 @@ CREATE TABLE IF NOT EXISTS oauth_states (
     verifier TEXT NOT NULL,
     match_value TEXT NOT NULL,
     expires_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS branch_owners (
+    tenant TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (tenant, repo, branch)
 );
 """
 
@@ -244,3 +253,38 @@ class Store:
         if not rows or rows[0][4] < time.time():
             return None
         return OAuthState(*rows[0][:4])
+
+    # -- branch owners (tenants with branch_owners = true) ------------------------
+
+    def claim_branch(self, tenant: str, repo: str, branch: str, subject: str) -> tuple[str, bool]:
+        """Record ``subject`` as the branch's owner unless one is recorded already.
+
+        Returns ``(owner, claimed)``: the recorded owner, and whether this call
+        recorded it. The first claim wins and is never replaced, so of two
+        people racing to create one branch, only the first may write it.
+        """
+        with self._lock:
+            cur = self._db.execute(
+                "INSERT OR IGNORE INTO branch_owners VALUES (?, ?, ?, ?, ?)",
+                (tenant, repo.casefold(), branch, subject, time.time()),
+            )
+            claimed = cur.rowcount == 1
+            rows = self._db.execute(
+                "SELECT subject FROM branch_owners WHERE tenant = ? AND repo = ? AND branch = ?",
+                (tenant, repo.casefold(), branch),
+            ).fetchall()
+        return rows[0][0], claimed
+
+    def release_branch(self, tenant: str, repo: str, branch: str, subject: str) -> None:
+        """Drop a claim whose branch was never created."""
+        self._q(
+            "DELETE FROM branch_owners WHERE tenant = ? AND repo = ? AND branch = ? AND subject = ?",
+            (tenant, repo.casefold(), branch, subject),
+        )
+
+    def branch_owner(self, tenant: str, repo: str, branch: str) -> str | None:
+        rows = self._q(
+            "SELECT subject FROM branch_owners WHERE tenant = ? AND repo = ? AND branch = ?",
+            (tenant, repo.casefold(), branch),
+        )
+        return rows[0][0] if rows else None

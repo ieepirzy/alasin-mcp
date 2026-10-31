@@ -8,7 +8,8 @@ Routes:
 - ``/oauth/forgejo/callback``: the Forgejo OAuth redirect target for
   user-delegated tenants, public (it is protected by the single-use state).
 - With ``[auth.oauth]``: the front door's discovery and sign-in routes
-  (``/.well-known/...``, ``/authorize``, ``/token``, ...), public.
+  (``/.well-known/...``, ``/authorize``, ``/authorize/callback``, ``/token``,
+  ...), public.
 
 Configuration: ``ALASIN_CONFIG`` names the TOML file (see README.md).
 """
@@ -147,12 +148,16 @@ def from_config(
     if cfg.jwt is not None:
         verifiers.append(JwtVerifier(cfg.jwt))
     sink = audit_sink or FanoutAuditSink([JsonlAuditSink(cfg.server.audit_dir), StreamAuditSink()])
+    writer_groups: dict[str, frozenset[str]] = {}
+    if cfg.oauth is not None and cfg.oauth.identity_provider is not None:
+        writer_groups[cfg.oauth.tenant] = frozenset(cfg.oauth.identity_provider.allowed_groups)
     services = Services(
         resolver=resolver,
         credentials=ModeRouter(providers),
         store=store,
         audit_sink=sink,
         session_ttl=cfg.server.session_ttl_seconds,
+        writer_groups=writer_groups,
     )
     oauth = front_door(cfg.oauth, cfg.oauth.base_url, MCP_PATH) if cfg.oauth else None
     return build_app(

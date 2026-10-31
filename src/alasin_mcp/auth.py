@@ -50,6 +50,10 @@ class Principal:
     via_gateway: bool = False
     # The identity provider asserted the email is verified (email_verified).
     email_verified: bool = False
+    # The person's own subject at the upstream IdP (a Keycloak user ID), for
+    # principals that signed in through the OAuth front door's identity
+    # provider. Sent to the branch webhook as owner_sub.
+    idp_subject: str | None = None
 
     @property
     def key(self) -> tuple[str, str]:

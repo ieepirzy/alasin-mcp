@@ -18,9 +18,19 @@ An external OAuth/OIDC issuer would be another implementation: its verifier
 is a ``JwtVerifier`` against the issuer's JWKS, and its routes serve only the
 protected-resource metadata naming that issuer.
 
-Every token from a front door maps to one configured tenant. The subject is
-the OAuth client, not a person: origo has no user accounts. Per-person or
-per-agent authorization is not done here.
+Every token from a front door maps to one configured tenant. Who the subject
+is depends on how people sign in:
+
+- With ``[auth.oauth.identity_provider]``, origo sends each person to the
+  upstream OIDC provider (Keycloak) and its tokens carry that person's claims.
+  The subject is ``oauth:<origo sub>``, where origo's sub is
+  ``<issuer>|<IdP sub>``; the name, the verified email and the groups come
+  with it. A token that names no person, or names one from another issuer, is
+  refused.
+- Without one, origo's approve-only consent page authenticates nobody, so the
+  subject is the OAuth client, ``oauth:<client id>``, shared by everyone who
+  signs in through it. origo refuses that unless
+  ``allow_unauthenticated_consent`` is set.
 """
 
 from __future__ import annotations
@@ -30,7 +40,12 @@ from typing import Any, Protocol
 from starlette.applications import Starlette
 
 from .auth import Principal, TokenVerifier
-from .config import OAUTH_SUBJECT_PREFIX, ConfigError, OAuthServerConfig
+from .config import (
+    OAUTH_SUBJECT_PREFIX,
+    ConfigError,
+    IdentityProviderConfig,
+    OAuthServerConfig,
+)
 
 
 class OAuthFrontDoor(Protocol):
@@ -46,9 +61,12 @@ class OAuthFrontDoor(Protocol):
 
 
 class _OrigoVerifier:
-    def __init__(self, provider: Any, tenant: str):
+    def __init__(self, provider: Any, tenant: str, issuer: str | None = None):
         self._provider = provider
         self._tenant = tenant
+        # Set when people sign in through an IdP: every token must then name a
+        # person from exactly this issuer.
+        self._issuer = issuer
 
     async def verify(self, token: str) -> Principal | None:
         # Bound to this server's resource, so a token origo minted for another
@@ -59,7 +77,42 @@ class _OrigoVerifier:
         client = meta.get("client_id")
         if not isinstance(client, str) or not client:
             return None
-        return Principal(tenant=self._tenant, subject=OAUTH_SUBJECT_PREFIX + client)
+        if self._issuer is None:
+            return Principal(tenant=self._tenant, subject=OAUTH_SUBJECT_PREFIX + client)
+        sub = meta.get("sub")
+        prefix = self._issuer + "|"
+        if not isinstance(sub, str) or not sub.startswith(prefix) or len(sub) == len(prefix):
+            return None
+        name, email, groups = meta.get("name"), meta.get("email"), meta.get("groups")
+        return Principal(
+            tenant=self._tenant,
+            subject=OAUTH_SUBJECT_PREFIX + sub,
+            name=name if isinstance(name, str) and name.strip() else None,
+            email=email if isinstance(email, str) and email else None,
+            claims={
+                **meta,
+                "groups": [g for g in groups if isinstance(g, str)]
+                if isinstance(groups, list)
+                else [],
+            },
+            # origo includes email only when the IdP asserted email_verified.
+            email_verified=isinstance(email, str) and bool(email),
+            idp_subject=sub[len(prefix) :],
+        )
+
+
+def _identity_provider(cfg: IdentityProviderConfig) -> Any:
+    from origo import IdentityProvider
+
+    return IdentityProvider(
+        issuer=cfg.issuer,
+        client_id=cfg.client_id,
+        client_secret=cfg.client_secret.resolve(),
+        allowed_groups=list(cfg.allowed_groups),
+        groups_claim=cfg.groups_claim,
+        allowed_email_domains=list(cfg.allowed_email_domains) or None,
+        max_grant_age=cfg.max_grant_age_seconds,
+    )
 
 
 class OrigoFrontDoor:
@@ -71,6 +124,7 @@ class OrigoFrontDoor:
                 'auth.oauth provider = "origo" needs the origo extra: '
                 "pip install 'alasin-mcp[origo]'"
             ) from e
+        idp = cfg.identity_provider
         self._provider = OAuthProvider(
             base_url=base_url,
             clients={c.id: c.secret.resolve() for c in cfg.clients},
@@ -82,8 +136,12 @@ class OrigoFrontDoor:
             client_ttl=cfg.client_ttl_seconds,
             mcp_path=mcp_path,
             storage_path=cfg.storage_path or None,
+            identity_provider=_identity_provider(idp) if idp is not None else None,
+            allow_unauthenticated_consent=cfg.allow_unauthenticated_consent,
         )
-        self.verifier: TokenVerifier = _OrigoVerifier(self._provider, cfg.tenant)
+        self.verifier: TokenVerifier = _OrigoVerifier(
+            self._provider, cfg.tenant, idp.issuer if idp is not None else None
+        )
 
     def install(self, app: Starlette) -> tuple[str, ...]:
         # Routes and state are both taken from origo's own app: its handlers
@@ -94,7 +152,8 @@ class OrigoFrontDoor:
         for key, value in vars(oauth_app.state)["_state"].items():
             setattr(app.state, key, value)
         # origo's handlers check their own credentials (client secret, code,
-        # PKCE verifier, the bearer on /userinfo); none takes an /mcp token.
+        # PKCE verifier, the IdP's answer on /authorize/callback, the bearer on
+        # /userinfo); none takes an /mcp token.
         return tuple(getattr(r, "path", "") for r in oauth_app.routes)
 
     def challenge(self) -> bytes:

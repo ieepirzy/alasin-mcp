@@ -7,14 +7,21 @@
   Forgejo until the branch exists, within a bounded time.
 
 Webhook request: ``POST <url>`` with a JSON body
-``{"tenant", "repo", "branch", "from_ref", "session_id", "subject"}`` and
+``{"tenant", "repo", "branch", "from_ref", "session_id", "subject"}``, plus
+``"owner_sub"`` when the caller signed in through the OAuth front door's
+identity provider: the person's own subject at that IdP (for Keycloak, the
+user ID), so the receiver can record who owns the branch. It is covered by
+the signature like every other field. And these headers:
 
 - ``X-Alasin-Timestamp``: Unix seconds;
 - ``X-Alasin-Signature``: ``sha256=`` + hex HMAC-SHA256 over
   ``"<timestamp>." + <raw body>`` with the tenant's webhook secret.
 
 The receiver should check the signature, reject stale timestamps, and answer
-2xx once it has accepted the request. On a refusal it may answer a JSON body
+2xx once it has accepted the request. In a tenant with ``branch_owners``, the
+server may re-request a branch that already exists when it has lost its own
+owner record: the receiver should answer 2xx only if ``owner_sub`` is the
+branch's registered owner, and refuse (409) anyone else. On a refusal it may answer a JSON body
 ``{"error": "<reason>"}``; the reason reaches the model, so it can correct
 the request.
 
@@ -95,17 +102,17 @@ class WebhookBranchCreator:
         hook = request.tenant.branch_webhook
         if hook is None:
             raise BranchCreationError("branch_creation=webhook but no webhook is configured")
-        body = json.dumps(
-            {
-                "tenant": request.tenant.id,
-                "repo": request.repo.full_name,
-                "branch": request.branch,
-                "from_ref": request.from_ref,
-                "session_id": request.session_id,
-                "subject": request.principal.subject,
-            },
-            separators=(",", ":"),
-        ).encode()
+        payload = {
+            "tenant": request.tenant.id,
+            "repo": request.repo.full_name,
+            "branch": request.branch,
+            "from_ref": request.from_ref,
+            "session_id": request.session_id,
+            "subject": request.principal.subject,
+        }
+        if request.principal.idp_subject is not None:
+            payload["owner_sub"] = request.principal.idp_subject
+        body = json.dumps(payload, separators=(",", ":")).encode()
         timestamp = str(int(time.time()))
         # Re-read on every call, so the secret rotates without a restart.
         secret = hook.secret.resolve()
