@@ -69,8 +69,6 @@ _HASHED = frozenset({"branch", "from_ref", "ref", "base", "path"})
 # else becomes a digest, so nobody can lock a name or an email into the
 # bucket by sending it as a client id, a grant type or a session id.
 _GRANT_TYPES = frozenset({"authorization_code", "refresh_token", "client_credentials"})
-# origo's registered clients: secrets.token_urlsafe(16).
-_DCR_CLIENT = re.compile(r"[A-Za-z0-9_-]{22}")
 # alasin's own session ids (store.py): "ws_" + secrets.token_urlsafe(18).
 _SESSION = re.compile(r"ws_[A-Za-z0-9_-]{24}")
 _HEX_SHA = re.compile(r"[0-9a-f]{64}")
@@ -89,8 +87,10 @@ _known_clients: frozenset[str] = frozenset()
 
 
 def known_client_ids(ids: Iterable[str]) -> None:
-    """The configured OAuth client ids, written as they are; any other
-    client_id that is not origo-registered-shaped becomes a digest."""
+    """The configured OAuth client ids, written as they are. Any other
+    client_id is written as given only on the outcome of a token origo
+    issued for it (redact(..., trusted=...)); everywhere else, a digest: an
+    unauthenticated /token request can name any client id it likes."""
     global _known_clients
     _known_clients = frozenset(ids)
 
@@ -116,7 +116,7 @@ def _shaped(key: str, value: str) -> bool:
     if key == "grant_type":
         return value in _GRANT_TYPES
     if key == "client_id":
-        return value in _known_clients or bool(_DCR_CLIENT.fullmatch(value))
+        return value in _known_clients
     if key == "client_ip":
         return _ip_shaped(value)
     if key == "repo":
@@ -151,13 +151,17 @@ def who(principal: Principal) -> dict[str, str]:
     return {"subject": principal.subject}
 
 
-def redact(event: dict[str, Any], *, top: bool = True) -> dict[str, Any]:
+def redact(
+    event: dict[str, Any], *, top: bool = True, trusted: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     """The event as it is written: no names, emails or free text. Known
     identifying fields are dropped, refs and paths become ``<key>_sha256``,
     an error message becomes its digest, a caller-chosen value is kept only in
     its own narrow shape, and any other text becomes a digest too (fail safe,
     not open). Nested objects (``arguments``, ``result``, files) get the same
-    treatment, except that only the top level keeps the code-set fields."""
+    treatment, except that only the top level keeps the code-set fields.
+    ``trusted`` names top-level keys the caller has verified (the client id
+    of a token origo issued), written as they are."""
     out: dict[str, Any] = {}
     for key, value in event.items():
         if key in _DROP or value is None and key in _HASHED:
@@ -175,7 +179,9 @@ def redact(event: dict[str, Any], *, top: bool = True) -> dict[str, Any]:
             out[key] = [
                 redact(v, top=False) if isinstance(v, dict) else _item(key, v) for v in value
             ]
-        elif isinstance(value, str) and (top and key in _KEEP or _shaped(key, value)):
+        elif isinstance(value, str) and (
+            top and (key in _KEEP or key in trusted) or _shaped(key, value)
+        ):
             out[key] = value
         elif isinstance(value, str):
             out.update(digest(key, value))

@@ -108,10 +108,12 @@ and SHA-256, not copied. A short branch name's SHA-256 can be guessed from a lis
 likely names: the commit SHA, not the branch, is what locates a change.
 Values a caller chooses are written only in their own narrow shape, otherwise as a digest:
 `grant_type` only as one of `authorization_code`, `refresh_token`, `client_credentials`;
-`client_id` only as a configured client or an origo-registered id; `session_id` only as
-alasin's own `ws_…` id; `repo` only when the tenant's configuration names its owner (an
-argument's repo always as its SHA-256); `client_ip` only as an IP address. Nested
-arguments and results get the same rules.
+`client_id` only as a configured client, or on the outcome of a token origo issued for it
+(an attempt or a refusal names it only as a digest: anyone can send any id); `session_id`
+only as a live session of the caller's (alasin's exact `ws_` + 24-character id); `repo`, and
+a result's `url`, only when the tenant's configuration names the owner (an argument's repo
+always as its SHA-256); `client_ip` only as an IP address. Nested arguments and results get
+the same rules.
 `client_ip` is the raw address in the local file; the Muutto365 audit-log gateway replaces
 every IP address with a keyed hash before the record reaches the object-locked bucket.
 Authorization links and OAuth `state` never reach audit events or span status. Spans

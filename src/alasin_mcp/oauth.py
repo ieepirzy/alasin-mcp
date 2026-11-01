@@ -260,8 +260,8 @@ class OrigoFrontDoor:
         sink = self._audit_sink
         assert sink is not None
 
-        async def emit(event: dict[str, Any]) -> None:
-            await anyio.to_thread.run_sync(sink.emit, redact(event))
+        async def emit(event: dict[str, Any], trusted: frozenset[str] = frozenset()) -> None:
+            await anyio.to_thread.run_sync(sink.emit, redact(event, trusted=trusted))
 
         async def token(request: Request) -> Response:
             form = await _read_token_form(request)
@@ -313,7 +313,9 @@ class OrigoFrontDoor:
                 **who(principal),
             )
             try:
-                await emit(outcome)
+                # origo issued a token to this client and it was attributed:
+                # the client id is origo's, not just whatever the form said.
+                await emit(outcome, trusted=frozenset({"client_id"}))
             except Exception:
                 if grant_type == "refresh_token":
                     # origo already rotated the refresh token: withholding the

@@ -300,6 +300,9 @@ class Services:
         if session_id is not None:
             session = self.store.get_session(tenant.id, principal.subject, session_id)
             if session is None:
+                # Not a session of this caller's: their own text, not an id.
+                event.pop("session_id", None)
+                event.update(digest("session_id", session_id))
                 msg = "unknown or expired session_id; call begin_change first"
                 await self._finish(event, None, error=msg, error_kind="unknown_session")
                 raise ToolError(msg)
@@ -355,7 +358,11 @@ class Services:
                 for key in ("repo", "branch", "commit", "author", "committer"):
                     if event.get(key) is not None:
                         span.set_attribute(f"alasin.{key}", str(event[key]))
-                summary = _result_summary(result) if result is not None else None
+                summary = (
+                    _result_summary(result, owner_named="repo" in event)
+                    if result is not None
+                    else None
+                )
                 await self._finish(event, span, result=summary, error=error, error_kind=error_kind)
             assert result is not None
             return result
@@ -465,14 +472,19 @@ _RESULT_KEEP = frozenset(
 )
 
 
-def _result_summary(result: dict[str, Any]) -> dict[str, Any]:
+def _result_summary(result: dict[str, Any], *, owner_named: bool = False) -> dict[str, Any]:
     """The result as recorded: ids, shas, counts and flags kept; lists as
     their length; author and committer left out; any other text (paths,
-    branches, messages, file contents) as ``<key>_sha256`` and ``<key>_chars``."""
+    branches, messages, file contents) as ``<key>_sha256`` and ``<key>_chars``.
+    A URL names the repo's owner, so it is kept only when the event names the
+    repo itself (``owner_named``: the configuration names that owner)."""
     out: dict[str, Any] = {}
     for k, v in result.items():
         if k in ("author", "committer"):
             continue  # people; the commit records them
+        if k == "url" and not owner_named and isinstance(v, str):
+            out.update(digest(k, v))
+            continue
         if isinstance(v, list):
             out[k] = {"count": len(v)}
         elif v is None or isinstance(v, bool | int | float):

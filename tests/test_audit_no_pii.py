@@ -254,7 +254,7 @@ def test_redact_keeps_caller_values_only_in_their_own_shape() -> None:
         assert "client_id" not in e and "grant_type" not in e and "session_id" not in e
     good = redact(
         {
-            "client_id": "A" * 22,
+            "client_id": test_oauth.CLIENT,
             "grant_type": "refresh_token",
             "session_id": "ws_" + "a" * 24,
             "repo": "acme/site",
@@ -263,7 +263,7 @@ def test_redact_keeps_caller_values_only_in_their_own_shape() -> None:
             "arguments": {"files": [{"path_sha256": "0" * 64, "encoding": "utf-8"}]},
         }
     )
-    assert good["client_id"] == "A" * 22 and good["grant_type"] == "refresh_token"
+    assert good["client_id"] == test_oauth.CLIENT and good["grant_type"] == "refresh_token"
     assert good["session_id"] == "ws_" + "a" * 24 and good["repo"] == "acme/site"
     assert good["client_ip"] == "2a01:4f8::7" and good["trace_id"] == "0" * 32
     assert good["arguments"]["files"][0] == {"path_sha256": "0" * 64, "encoding": "utf-8"}
@@ -321,3 +321,114 @@ async def test_a_hostile_session_id_and_repo_leave_no_personal_data() -> None:
     assert "ilari-testinen" not in json.dumps(events)
     assert all(e.get("repo") in (None, "acme/site") for e in events)
     assert all(e.get("session_id") in (None, sid) for e in events)
+
+
+# -- last review round: client ids, result URLs, session ids --------------------------
+
+# Exactly the shape of an origo-registered client id (token_urlsafe(16)),
+# chosen by a caller to carry a name.
+NAMED_CLIENT = "IlariTestinenHelsinki0"
+
+
+def test_a_client_id_is_kept_only_when_configured_or_trusted() -> None:
+    assert len(NAMED_CLIENT) == 22
+    e = redact({"client_id": NAMED_CLIENT})
+    assert "client_id" not in e and e["client_id_sha256"]
+    assert redact({"client_id": NAMED_CLIENT}, trusted=frozenset({"client_id"}))["client_id"] == (
+        NAMED_CLIENT
+    )
+    # trusted applies at the top level only.
+    nested = redact({"arguments": {"client_id": NAMED_CLIENT}}, trusted=frozenset({"client_id"}))
+    assert "client_id" not in nested["arguments"]
+
+
+async def test_an_unauthenticated_client_id_of_the_registered_shape_is_a_digest() -> None:
+    sink = MemoryAuditSink()
+    with test_oauth.running(sink) as base:
+        async with httpx.AsyncClient(timeout=10) as h:
+            r = await h.post(
+                f"{base}/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "client_id": NAMED_CLIENT,
+                    "client_secret": "x",
+                    "code": "c",
+                },
+            )
+            assert r.status_code != 200
+    phases = {e["phase"] for e in sink.events}
+    assert phases == {"attempt", "outcome"}
+    assert NAMED_CLIENT not in json.dumps(sink.events)
+    assert all("client_id_sha256" in e and "client_id" not in e for e in sink.events)
+
+
+async def test_an_issued_token_names_its_client_even_when_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The client id origo issued a token for is origo's: kept on that
+    outcome. The attempt before it, still unauthenticated, is a digest."""
+    import alasin_mcp.audit as audit
+
+    person = Principal(tenant="t", subject=f"oauth:{ISSUER}|ilari-id", idp_subject="ilari-id")
+
+    async def issued(self: Any, response: Any) -> Principal | None:
+        return person if response.status_code == 200 else None
+
+    monkeypatch.setattr(OrigoFrontDoor, "_issued_principal", issued)
+    sink = MemoryAuditSink()
+    with test_oauth.running(sink) as base:
+        monkeypatch.setattr(
+            audit, "_known_clients", frozenset()
+        )  # as if registered, not configured
+        first = await test_oauth._exchange(base, test_oauth.SECRET)
+        assert first.status_code == 200, first.text
+    attempt = next(e for e in sink.events if e["phase"] == "attempt")
+    outcome = next(e for e in sink.events if e["phase"] == "outcome")
+    assert "client_id" not in attempt and attempt["client_id_sha256"]
+    assert outcome["outcome"] == "ok" and outcome["client_id"] == test_oauth.CLIENT
+
+
+async def test_a_result_url_is_gated_like_the_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The commit URL names the repo's owner: where the repo is written only
+    as a digest (the owner is not configured), so is the URL."""
+    import alasin_mcp.tools as tools
+
+    with people() as p:
+        sink: MemoryAuditSink = p.services.audit_sink
+        assert not (await p.create("alice", "lane/alice")).is_error
+        monkeypatch.setattr(tools, "owner_configured", lambda tenant, name: False)
+        ok = await p.commit("alice", "lane/alice")
+        assert not ok.is_error, ok.text
+    outcome = next(
+        e
+        for e in sink.events
+        if e.get("tool") == "commit_files" and e["phase"] == "outcome" and e["outcome"] == "ok"
+    )
+    assert "repo" not in outcome and outcome["repo_sha256"]
+    assert "url" not in outcome["result"] and outcome["result"]["url_sha256"]
+    assert "acme" not in json.dumps(outcome)
+
+
+def test_a_result_url_is_kept_where_the_owner_is_named() -> None:
+    from alasin_mcp.tools import _result_summary
+
+    url = "https://forgejo.example.com/acme/site/commit/abc"
+    assert _result_summary({"url": url}, owner_named=True)["url"] == url
+    assert "url" not in _result_summary({"url": url}, owner_named=False)
+
+
+async def test_a_session_id_is_kept_only_when_it_is_a_live_session() -> None:
+    with people() as p:
+        sink: MemoryAuditSink = p.services.audit_sink
+        sid = await p.sid("alice")
+        unknown = "ws_" + "A" * 24  # the right shape, no such session
+        name_like = "ws_IlariTestinenFromHelsinkiFinland"  # name-like, wrong length
+        for bad in (unknown, name_like):
+            args = {"session_id": bad, "repo": "acme/site", "branch": "lane/alice"}
+            assert (await call_tool(p.url, "alice", "create_branch", args)).is_error
+    events = sink.events
+    dumped = json.dumps(events)
+    assert unknown not in dumped and name_like not in dumped
+    assert all(e.get("session_id") in (None, sid) for e in events)
+    assert redact({"session_id": name_like}).get("session_id") is None
+    assert redact({"session_id": "ws_" + "A" * 25}).get("session_id") is None
