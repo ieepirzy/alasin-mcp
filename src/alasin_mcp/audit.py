@@ -49,6 +49,15 @@ class JsonlAuditSink:
         self._dir = directory
         self._lock = threading.Lock()
 
+    def ensure_dir(self) -> None:
+        """Create the audit directory and make its entry durable (fsync the
+        parent). Raises if it cannot."""
+        with self._lock:
+            path = os.path.abspath(self._dir)
+            if not os.path.isdir(path):
+                os.makedirs(path, mode=0o750, exist_ok=True)
+                _fsync_dir(os.path.dirname(path))
+
     def emit(self, event: dict[str, Any]) -> None:
         tenant = validation.tenant_id(str(event["tenant"]))
         day = time.strftime("%Y-%m-%d", time.gmtime())

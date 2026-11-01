@@ -32,21 +32,31 @@ is depends on how people sign in:
   signs in through it. origo refuses that unless
   ``allow_unauthenticated_consent`` is set.
 
-Sign-ins are audited at origo's ``/token`` (it has no issuance hook): each
-issued token is recorded as a ``sign_in`` (authorization code) or
-``token_refresh`` event naming the person, before the response leaves. If that
-record cannot be written, the client gets 503 instead of the token, the same
-fail-closed rule as the write tools (the token origo already minted is never
-delivered and expires unused). Refused exchanges are recorded best effort.
+Sign-ins are audited at origo's ``/token`` (it has no issuance hook), in the
+same two phases as the write tools:
+
+1. an *attempt* event (grant type, client, address) is written BEFORE origo
+   sees the request. If it cannot be written the client gets 503 and origo
+   is never called, so no code or refresh token is spent (fail closed);
+2. an *outcome* event naming the person the issued token speaks for. A token
+   that cannot be attributed (an unparsable response, or a token our own
+   verifier refuses) is never delivered: 503. If only the outcome write
+   fails: a sign-in (authorization code) gets 503, which costs a fresh
+   authorization; a refresh gets its token, logged, because origo has
+   already rotated the refresh token and withholding it would end the
+   session.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
+from urllib.parse import unquote
 
+import anyio
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -54,6 +64,7 @@ from starlette.routing import Route
 
 from .audit import AuditSink, new_event
 from .auth import Principal, TokenVerifier
+from .clientip import ClientIpPolicy
 from .config import (
     OAUTH_SUBJECT_PREFIX,
     ConfigError,
@@ -67,6 +78,12 @@ log = logging.getLogger("alasin_mcp")
 # turns into an access token.
 TOKEN_PATH = "/token"  # noqa: S105 - a URL path, not a credential
 _GRANT_ACTIONS = {"authorization_code": "sign_in", "refresh_token": "token_refresh"}
+# origo's own limit on a /token form (endpoints._read_body_limited).
+_MAX_TOKEN_BODY = 1024 * 1024
+_UNAVAILABLE = {
+    "error": "temporarily_unavailable",
+    "error_description": "the audit trail is unavailable; try again",
+}
 
 
 class OAuthFrontDoor(Protocol):
@@ -125,17 +142,39 @@ class _OrigoVerifier:
         )
 
 
-async def _grant(request: Request) -> tuple[str, str]:
-    """grant_type and client_id of a /token request origo has already read."""
+async def _read_token_form(request: Request) -> tuple[str, str] | None:
+    """grant_type and client_id of a /token request, read before origo sees
+    it. The body is read once, with origo's own size limit, into the cache
+    origo then uses (request._body); Starlette parses the form once for
+    both. None: a body origo would refuse anyway (too large, unparsable)."""
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > _MAX_TOKEN_BODY:
+            return None
+    request._body = bytes(body)  # pyright: ignore[reportAttributeAccessIssue]
     try:
         form = await request.form()
-    except Exception:  # noqa: BLE001 - a body origo refused may not parse
-        return "", ""
+    except Exception:  # noqa: BLE001 - a malformed form; origo answers 400
+        return None
     grant_type, client_id = form.get("grant_type"), form.get("client_id")
-    return (
-        grant_type if isinstance(grant_type, str) else "",
-        client_id if isinstance(client_id, str) else "",
-    )
+    client = client_id if isinstance(client_id, str) else ""
+    if not client:
+        client = _basic_client_id(request.headers.get("authorization", ""))
+    return (grant_type if isinstance(grant_type, str) else "", client)
+
+
+def _basic_client_id(header: str) -> str:
+    """The client id of client_secret_basic (RFC 6749 2.3.1), or ''."""
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() != "basic" or not value:
+        return ""
+    try:
+        decoded = base64.b64decode(value.strip(), validate=True).decode()
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    user, sep, _ = decoded.partition(":")
+    return unquote(user) if sep else ""
 
 
 def _identity_provider(cfg: IdentityProviderConfig) -> Any:
@@ -159,9 +198,11 @@ class OrigoFrontDoor:
         base_url: str,
         mcp_path: str,
         audit_sink: AuditSink | None = None,
+        client_ip: ClientIpPolicy | None = None,
     ):
         self._tenant = cfg.tenant
         self._audit_sink = audit_sink
+        self._client_ip = client_ip or ClientIpPolicy()
         try:
             from origo import OAuthProvider
         except ImportError as e:
@@ -218,45 +259,73 @@ class OrigoFrontDoor:
         sink = self._audit_sink
         assert sink is not None
 
+        async def emit(event: dict[str, Any]) -> None:
+            await anyio.to_thread.run_sync(sink.emit, event)
+
         async def token(request: Request) -> Response:
-            # origo reads (and size-limits) the body itself; afterwards
-            # Starlette hands back the form it already parsed.
-            response = await endpoint(request)
-            grant_type, client_id = await _grant(request)
-            event = new_event(
+            form = await _read_token_form(request)
+            if form is None:
+                # origo refuses it too (it sees the same cached body); no
+                # token can come of it, so no attempt to record.
+                return await endpoint(request)
+            grant_type, client_id = form
+            base = new_event(
                 tenant=self._tenant,
                 action=_GRANT_ACTIONS.get(grant_type, "token"),
                 grant_type=grant_type or None,
                 client_id=client_id or None,
-                client_ip=request.client.host if request.client else None,
-                phase="outcome",
+                client_ip=self._client_ip.client_ip(request),
             )
+            try:
+                await emit({**base, "phase": "attempt"})
+            except Exception:
+                log.error("token attempt event could not be recorded; refusing before origo")
+                return JSONResponse(
+                    _UNAVAILABLE, status_code=503, headers={"Cache-Control": "no-store"}
+                )
+            response = await endpoint(request)
+            outcome = {**base, **new_event(), "phase": "outcome", "status": response.status_code}
+            if response.status_code != 200:
+                outcome["outcome"] = "error"
+                try:
+                    await emit(outcome)
+                except Exception:
+                    log.exception(
+                        "audit outcome for a refused token exchange could not be recorded"
+                    )
+                return response
             principal = await self._issued_principal(response)
             if principal is None:
-                event["outcome"] = "error"
-                event["status"] = response.status_code
+                # A 200 whose token we cannot attribute: never delivered.
+                outcome.update(outcome="error", error="issued token could not be attributed")
                 try:
-                    sink.emit(event)
+                    await emit(outcome)
                 except Exception:
-                    log.exception("audit event for a refused token exchange could not be recorded")
-                return response
-            event.update(
+                    log.exception("audit outcome for an unattributed token could not be recorded")
+                log.error("token issued that no verifier attributes; withholding it")
+                return JSONResponse(
+                    _UNAVAILABLE, status_code=503, headers={"Cache-Control": "no-store"}
+                )
+            outcome.update(
                 outcome="ok",
                 subject=principal.subject,
                 principal_name=principal.name,
                 principal_email=principal.email,
             )
             try:
-                sink.emit(event)
+                await emit(outcome)
             except Exception:
-                log.error("sign-in audit event could not be recorded; withholding the token")
+                if grant_type == "refresh_token":
+                    # origo already rotated the refresh token: withholding the
+                    # new pair would end the session. The attempt is recorded.
+                    log.error(
+                        "token refresh outcome could not be recorded; delivering (attempt %s)",
+                        base["event_id"],
+                    )
+                    return response
+                log.error("sign-in outcome could not be recorded; withholding the token")
                 return JSONResponse(
-                    {
-                        "error": "temporarily_unavailable",
-                        "error_description": "the audit trail is unavailable; try again",
-                    },
-                    status_code=503,
-                    headers={"Cache-Control": "no-store"},
+                    _UNAVAILABLE, status_code=503, headers={"Cache-Control": "no-store"}
                 )
             return response
 
@@ -267,9 +336,10 @@ class OrigoFrontDoor:
         if response.status_code != 200:
             return None
         try:
-            access = json.loads(bytes(response.body)).get("access_token")
-        except (ValueError, AttributeError):
+            payload = json.loads(bytes(response.body))
+        except (ValueError, TypeError, AttributeError):
             return None
+        access = payload.get("access_token") if isinstance(payload, dict) else None
         if not isinstance(access, str) or not access:
             return None
         return await self.verifier.verify(access)
@@ -284,7 +354,8 @@ def front_door(
     base_url: str,
     mcp_path: str,
     audit_sink: AuditSink | None = None,
+    client_ip: ClientIpPolicy | None = None,
 ) -> OAuthFrontDoor:
     if cfg.provider == "origo":
-        return OrigoFrontDoor(cfg, base_url, mcp_path, audit_sink)
+        return OrigoFrontDoor(cfg, base_url, mcp_path, audit_sink, client_ip)
     raise ConfigError(f"unknown auth.oauth provider {cfg.provider!r}")

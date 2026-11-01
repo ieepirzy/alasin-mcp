@@ -231,6 +231,11 @@ class ServerConfig:
     # the name your gateway uses to reach this server. Empty disables the check.
     allowed_hosts: tuple[str, ...] = ()
     forwarded_allow_ips: str = "127.0.0.1"
+    # The caller's address for audit events (clientip.py): this header, but
+    # only from a peer in client_ip_trusted_proxies (the tunnel connector).
+    # Unset: the peer address.
+    client_ip_header: str = ""
+    client_ip_trusted_proxies: tuple[str, ...] = ()
     state_path: str = "/var/lib/alasin/state.db"
     audit_dir: str = "/var/lib/alasin/audit"
     master_key: SecretRef = field(default_factory=SecretRef)
@@ -376,6 +381,8 @@ def parse(raw: dict[str, Any], env: Mapping[str, str] | None = None) -> Config:
         port=int(s.get("port", ServerConfig.port)),
         allowed_hosts=tuple(s.get("allowed_hosts", ())),
         forwarded_allow_ips=str(s.get("forwarded_allow_ips", ServerConfig.forwarded_allow_ips)),
+        client_ip_header=str(s.get("client_ip_header", "")),
+        client_ip_trusted_proxies=tuple(str(x) for x in s.get("client_ip_trusted_proxies", ())),
         state_path=str(s.get("state_path", ServerConfig.state_path)),
         audit_dir=str(s.get("audit_dir", ServerConfig.audit_dir)),
         master_key=_secret(s, "master_key"),

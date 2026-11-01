@@ -36,6 +36,7 @@ from .auth import (
     StaticTokenVerifier,
     TokenVerifier,
 )
+from .clientip import ClientIpPolicy
 from .config import AuthMode, Config
 from .credentials import (
     CredentialError,
@@ -149,8 +150,15 @@ def from_config(
         verifiers.append(JwtVerifier(cfg.jwt))
     # The JSONL file is the durable record: a write is refused when it fails
     # (fail closed). stderr is a convenience copy and never refuses anything.
-    sink = audit_sink or FanoutAuditSink(
-        [JsonlAuditSink(cfg.server.audit_dir)], best_effort=[StreamAuditSink()]
+    if audit_sink is None:
+        jsonl = JsonlAuditSink(cfg.server.audit_dir)
+        # At startup, not on the first event: a volume alasin cannot write
+        # stops it here, loudly, instead of refusing every write later.
+        jsonl.ensure_dir()
+        audit_sink = FanoutAuditSink([jsonl], best_effort=[StreamAuditSink()])
+    sink = audit_sink
+    client_ip = ClientIpPolicy.from_config(
+        cfg.server.client_ip_header, cfg.server.client_ip_trusted_proxies
     )
     writer_groups: dict[str, frozenset[str]] = {}
     if cfg.oauth is not None and cfg.oauth.identity_provider is not None:
@@ -162,8 +170,11 @@ def from_config(
         audit_sink=sink,
         session_ttl=cfg.server.session_ttl_seconds,
         writer_groups=writer_groups,
+        client_ip=client_ip,
     )
-    oauth = front_door(cfg.oauth, cfg.oauth.base_url, MCP_PATH, sink) if cfg.oauth else None
+    oauth = (
+        front_door(cfg.oauth, cfg.oauth.base_url, MCP_PATH, sink, client_ip) if cfg.oauth else None
+    )
     return build_app(
         services,
         ChainVerifier(verifiers),

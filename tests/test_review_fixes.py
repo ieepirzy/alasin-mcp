@@ -229,6 +229,49 @@ def test_jsonl_sink_raises_when_the_line_cannot_be_made_durable(
         JsonlAuditSink(str(tmp_path)).emit({"tenant": "t"})
 
 
+def _peer_request(peer: str, headers: dict[str, str] | None = None) -> Request:
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    return Request({"type": "http", "headers": raw, "client": (peer, 1234)})
+
+
+def test_client_ip_header_is_believed_only_from_a_trusted_proxy() -> None:
+    from alasin_mcp.clientip import ClientIpPolicy
+
+    policy = ClientIpPolicy.from_config("CF-Connecting-IP", ["10.244.0.0/16"])
+    tunnel = _peer_request("10.244.3.7", {"CF-Connecting-IP": "203.0.113.9"})
+    assert policy.client_ip(tunnel) == "203.0.113.9"
+    # Anyone else cannot choose the recorded address.
+    outsider = _peer_request("192.0.2.1", {"CF-Connecting-IP": "203.0.113.9"})
+    assert policy.client_ip(outsider) == "192.0.2.1"
+    # A trusted proxy with no header, or garbage: the peer, never the raw value.
+    assert policy.client_ip(_peer_request("10.244.3.7")) == "10.244.3.7"
+    bad = _peer_request("10.244.3.7", {"CF-Connecting-IP": "1.2.3.4, 5.6.7.8"})
+    assert policy.client_ip(bad) == "10.244.3.7"
+    # Unconfigured: the peer.
+    assert ClientIpPolicy().client_ip(tunnel) == "10.244.3.7"
+
+
+def test_audit_dir_is_created_at_startup_and_its_entry_made_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synced: list[str] = []
+    real_fsync = os.fsync
+
+    def fsync(fd: int) -> None:
+        synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    target = tmp_path / "state" / "audit"
+    (tmp_path / "state").mkdir()
+    JsonlAuditSink(str(target)).ensure_dir()
+    assert target.is_dir()
+    assert synced == [str(tmp_path / "state")]
+    synced.clear()
+    JsonlAuditSink(str(target)).ensure_dir()  # already there: nothing to sync
+    assert synced == []
+
+
 async def test_cancelled_call_still_records_its_outcome() -> None:
     sink = MemoryAuditSink()
     services = fake_services(_fake(), [_tenant()], sink)

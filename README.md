@@ -100,10 +100,14 @@ repository, branch, commit, author, committer and auth mode. File contents are r
 as size and SHA-256, not copied. Authorization links and OAuth `state` never reach audit
 events or span status.
 
-Sign-ins through the OAuth front door are audited too: every token origo issues at
-`/token` is a `sign_in` (authorization code) or `token_refresh` event with the person,
-client ID and client address, written before the token is sent. If it can't be recorded,
-the client gets 503 and no token. Refused exchanges are recorded best effort.
+Sign-ins through the OAuth front door are audited too, in the same two phases. Before
+origo sees a `/token` request, an *attempt* event (grant type, client ID, client address)
+is written; if it can't be, the client gets 503 and no code or refresh token is spent.
+After origo answers, an *outcome* event names the person the token speaks for (`sign_in`
+or `token_refresh`). A token that can't be attributed is never delivered (503). If only
+the outcome can't be recorded, a sign-in gets 503 (a fresh authorization fixes it) and a
+refresh gets its token, logged: origo has already rotated the refresh token, so
+withholding it would end the session.
 
 Writes fail closed. Before any mutating Forgejo call (creating a branch, committing) an
 *attempt* event is written; if it can't be recorded, the write isn't made. The outcome
@@ -254,6 +258,8 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `server.host`, `server.port` | `0.0.0.0`, `8000` | Bind address. |
 | `server.allowed_hosts` | `[]` | `Host` values accepted on `/mcp` (DNS-rebinding protection). Use the name your gateway uses to reach this server. Empty disables the check. |
 | `server.forwarded_allow_ips` | `127.0.0.1` | Proxies whose `X-Forwarded-*` headers are trusted. |
+| `server.client_ip_header` | (unset) | Header carrying the caller's address for audit events, e.g. `CF-Connecting-IP` behind cloudflared. |
+| `server.client_ip_trusted_proxies` | `[]` | CIDRs of the peers whose `client_ip_header` is believed (the tunnel connector). From any other peer the header is ignored and the peer address is recorded. |
 | `server.state_path` | `/var/lib/alasin/state.db` | SQLite: sessions, encrypted tokens, OAuth state. |
 | `server.audit_dir` | `/var/lib/alasin/audit` | `<tenant>/audit-<date>.jsonl`, each line fsynced (and the folder, when the line creates a file) before the call goes on. This file is the record that fails closed; the copy on stderr is best effort. |
 | `server.master_key_file` / `_env` | none | Base64 of 32 random bytes (`openssl rand -base64 32`). Required for `user_delegated`. |
