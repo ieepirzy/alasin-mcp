@@ -100,12 +100,17 @@ repository, branch, commit, author, committer and auth mode. File contents are r
 as size and SHA-256, not copied. Authorization links and OAuth `state` never reach audit
 events or span status.
 
+Sign-ins through the OAuth front door are audited too: every token origo issues at
+`/token` is a `sign_in` (authorization code) or `token_refresh` event with the person,
+client ID and client address, written before the token is sent. If it can't be recorded,
+the client gets 503 and no token. Refused exchanges are recorded best effort.
+
 Writes fail closed. Before any mutating Forgejo call (creating a branch, committing) an
 *attempt* event is written; if it can't be recorded, the write isn't made. The outcome
 event is written afterwards whatever happens. If only the outcome can't be recorded, the
 call still returns its result, because the write has landed and an error would invite a
-retry that duplicates it; the attempt event is the record. With several sinks, every
-sink is tried, and a failure in any of them counts as a failure.
+retry that duplicates it; the attempt event is the record. Every sink is tried; only a
+failure of a required sink (the JSONL file) counts as a failure. stderr is best effort.
 
 ## Auth modes
 
@@ -250,7 +255,7 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `server.allowed_hosts` | `[]` | `Host` values accepted on `/mcp` (DNS-rebinding protection). Use the name your gateway uses to reach this server. Empty disables the check. |
 | `server.forwarded_allow_ips` | `127.0.0.1` | Proxies whose `X-Forwarded-*` headers are trusted. |
 | `server.state_path` | `/var/lib/alasin/state.db` | SQLite: sessions, encrypted tokens, OAuth state. |
-| `server.audit_dir` | `/var/lib/alasin/audit` | `<tenant>/audit-<date>.jsonl`. Events also go to stderr. |
+| `server.audit_dir` | `/var/lib/alasin/audit` | `<tenant>/audit-<date>.jsonl`, each line fsynced (and the folder, when the line creates a file) before the call goes on. This file is the record that fails closed; the copy on stderr is best effort. |
 | `server.master_key_file` / `_env` | none | Base64 of 32 random bytes (`openssl rand -base64 32`). Required for `user_delegated`. |
 | `server.session_ttl_seconds` | `43200` | Work-session lifetime. |
 | `telemetry.otlp_endpoint` | `""` (off) | OTLP/HTTP traces endpoint. |

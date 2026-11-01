@@ -12,6 +12,7 @@ import threading
 import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,7 +22,12 @@ from starlette.requests import Request
 
 from alasin_mcp import validation
 from alasin_mcp.app import build_app
-from alasin_mcp.audit import AuditUnavailable, FanoutAuditSink, MemoryAuditSink
+from alasin_mcp.audit import (
+    AuditUnavailable,
+    FanoutAuditSink,
+    JsonlAuditSink,
+    MemoryAuditSink,
+)
 from alasin_mcp.auth import (
     PRINCIPAL_SCOPE_KEY,
     BearerAuthMiddleware,
@@ -171,6 +177,56 @@ def test_fanout_tries_every_sink_then_raises() -> None:
     with pytest.raises(AuditUnavailable):
         fan.emit({"phase": "outcome", "tenant": "t"})
     assert second.events == [{"phase": "outcome", "tenant": "t"}]
+
+
+def test_fanout_best_effort_sink_never_refuses() -> None:
+    # Fail closed on the local JSONL write only: a broken stderr copy must not
+    # refuse a write the durable record holds.
+    required, broken = MemoryAuditSink(), FailingSink("attempt")
+    FanoutAuditSink([required], best_effort=[broken]).emit({"phase": "attempt", "tenant": "t"})
+    assert required.events == [{"phase": "attempt", "tenant": "t"}]
+
+
+def test_fanout_required_sink_still_refuses_beside_a_working_best_effort() -> None:
+    copy = MemoryAuditSink()
+    fan = FanoutAuditSink([FailingSink("attempt")], best_effort=[copy])
+    with pytest.raises(AuditUnavailable):
+        fan.emit({"phase": "attempt", "tenant": "t"})
+    assert copy.events == [{"phase": "attempt", "tenant": "t"}]
+
+
+def test_jsonl_sink_fsyncs_the_line_and_each_new_directory_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synced: list[str] = []
+    real_fsync = os.fsync
+
+    def fsync(fd: int) -> None:
+        synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    sink = JsonlAuditSink(str(tmp_path))
+    sink.emit({"tenant": "t", "n": 1})
+    [day_file] = list((tmp_path / "t").glob("audit-*.jsonl"))
+    # The line, then the tenant folder (new file), then the root (new folder).
+    assert synced == [str(day_file), str(tmp_path / "t"), str(tmp_path)]
+    synced.clear()
+    sink.emit({"tenant": "t", "n": 2})
+    # An append to an existing file adds no directory entry.
+    assert synced == [str(day_file)]
+    assert [json.loads(x)["n"] for x in day_file.read_text().splitlines()] == [1, 2]
+
+
+def test_jsonl_sink_raises_when_the_line_cannot_be_made_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fsync(fd: int) -> None:
+        raise OSError("EIO")
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with pytest.raises(OSError):
+        JsonlAuditSink(str(tmp_path)).emit({"tenant": "t"})
 
 
 async def test_cancelled_call_still_records_its_outcome() -> None:

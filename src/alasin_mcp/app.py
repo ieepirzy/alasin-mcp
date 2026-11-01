@@ -147,7 +147,11 @@ def from_config(
         verifiers.append(StaticTokenVerifier.from_config(cfg.static_credentials))
     if cfg.jwt is not None:
         verifiers.append(JwtVerifier(cfg.jwt))
-    sink = audit_sink or FanoutAuditSink([JsonlAuditSink(cfg.server.audit_dir), StreamAuditSink()])
+    # The JSONL file is the durable record: a write is refused when it fails
+    # (fail closed). stderr is a convenience copy and never refuses anything.
+    sink = audit_sink or FanoutAuditSink(
+        [JsonlAuditSink(cfg.server.audit_dir)], best_effort=[StreamAuditSink()]
+    )
     writer_groups: dict[str, frozenset[str]] = {}
     if cfg.oauth is not None and cfg.oauth.identity_provider is not None:
         writer_groups[cfg.oauth.tenant] = frozenset(cfg.oauth.identity_provider.allowed_groups)
@@ -159,7 +163,7 @@ def from_config(
         session_ttl=cfg.server.session_ttl_seconds,
         writer_groups=writer_groups,
     )
-    oauth = front_door(cfg.oauth, cfg.oauth.base_url, MCP_PATH) if cfg.oauth else None
+    oauth = front_door(cfg.oauth, cfg.oauth.base_url, MCP_PATH, sink) if cfg.oauth else None
     return build_app(
         services,
         ChainVerifier(verifiers),

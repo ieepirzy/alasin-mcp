@@ -55,8 +55,10 @@ def _oauth_cfg(**kw: Any) -> OAuthServerConfig:
 
 
 @contextmanager
-def running() -> Iterator[str]:
-    """The app with a static bearer ``tok`` and the origo front door; yields the base URL."""
+def running(sink: Any = None) -> Iterator[str]:
+    """The app with a static bearer ``tok`` and the origo front door; yields the base URL.
+
+    With ``sink``, the front door audits sign-ins to it."""
     services = Services(
         resolver=StaticTenantResolver([tenant("t", "https://forgejo.example.com", "UNUSED")]),
         credentials=ModeRouter({AuthMode.SERVICE_ACCOUNT: ServiceAccountProvider()}),
@@ -65,7 +67,7 @@ def running() -> Iterator[str]:
     )
     port = free_port()
     base = f"http://127.0.0.1:{port}"
-    door = OrigoFrontDoor(_oauth_cfg(), base, "/mcp")
+    door = OrigoFrontDoor(_oauth_cfg(), base, "/mcp", sink)
     app = build_app(services, StaticTokenVerifier([("tok", "t", "s")]), oauth=door)
     with serve(app, port) as url:
         assert url == base + "/mcp"
@@ -126,6 +128,58 @@ async def test_signed_in_client_reaches_the_tools() -> None:
         assert {t.name for t in await list_tools(base + "/mcp", token)} >= {"begin_change"}
         res = await call_tool(base + "/mcp", token, "begin_change", {})
         assert not res.is_error, res.text
+
+
+class _BrokenSink:
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    def emit(self, event: dict[str, Any]) -> None:
+        self.attempts += 1
+        raise OSError("disk full")
+
+
+async def test_sign_in_is_audited_before_the_token_leaves() -> None:
+    sink = MemoryAuditSink()
+    with running(sink) as base:
+        token = await _sign_in(base)
+        assert await list_tools(base + "/mcp", token)
+    [event] = sink.events
+    assert event["action"] == "sign_in"
+    assert event["outcome"] == "ok"
+    assert event["grant_type"] == "authorization_code"
+    assert event["client_id"] == CLIENT
+    assert event["tenant"] == "t"
+    assert event["subject"] == "oauth:" + CLIENT
+    assert event["client_ip"] == "127.0.0.1"
+    assert event["event_id"] and event["time"]
+    # Never the token itself.
+    assert token not in repr(event)
+
+
+async def test_sign_in_fails_closed_when_it_cannot_be_audited() -> None:
+    sink = _BrokenSink()
+    with running(sink) as base:
+        tok = await _exchange(base, SECRET)
+    assert tok.status_code == 503, tok.text
+    assert "access_token" not in tok.json()
+    assert tok.json()["error"] == "temporarily_unavailable"
+    assert sink.attempts == 1
+
+
+async def test_refused_exchange_is_audited_best_effort() -> None:
+    sink = MemoryAuditSink()
+    with running(sink) as base:
+        tok = await _exchange(base, "wrong")
+    assert tok.status_code == 401
+    [event] = sink.events
+    assert event["action"] == "sign_in"
+    assert event["outcome"] == "error"
+    assert event["status"] == 401
+    assert "subject" not in event
+    # A broken sink does not turn a refusal into something else.
+    with running(_BrokenSink()) as base:
+        assert (await _exchange(base, "wrong")).status_code == 401
 
 
 async def test_static_bearer_still_works_beside_oauth() -> None:
