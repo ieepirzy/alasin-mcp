@@ -94,17 +94,28 @@ percent-encoded per segment. The HTTP client never follows redirects, so a token
 be carried to another host.
 
 **Audit.** One outcome event per tool call, success, failure or cancellation: time,
-tenant, subject, the caller's name and email when the token carries them, client
-address, tool, session ID, trace and span IDs, arguments, outcome, result summary,
-repository, branch, commit, author, committer and auth mode. File contents are recorded
-as size and SHA-256, not copied. Authorization links and OAuth `state` never reach audit
-events or span status.
+tenant, who called (`sub`, the person's Keycloak subject, for a person signed in through
+the identity provider; otherwise `subject`, the static credential's or OAuth client's
+configured subject), client address, tool, session ID, trace and span IDs, arguments,
+outcome, result summary, repository, commit, author source and auth mode.
+
+Audit events carry no personal data: no name, email or username, and no free text that
+could hold one. Commit messages, intents, branch names, refs, file paths, error messages
+and any other text are recorded as `<key>_sha256` and `<key>_chars` (an error also has a
+fixed `error_kind`); author arguments only as `author_given`; author and committer not
+at all (the commit records them; `commit` locates it). File contents are recorded as size
+and SHA-256, not copied. A short branch name's SHA-256 can be guessed from a list of
+likely names: the commit SHA, not the branch, is what locates a change.
+`client_ip` is the raw address in the local file; the Muutto365 audit-log gateway replaces
+every IP address with a keyed hash before the record reaches the object-locked bucket.
+Authorization links and OAuth `state` never reach audit events or span status. Spans
+(telemetry, not the audit trail) still carry branch, author and committer.
 
 Sign-ins through the OAuth front door are audited too, in the same two phases. Before
 origo sees a `/token` request, an *attempt* event (grant type, client ID, client address)
 is written; if it can't be, the client gets 503 and no code or refresh token is spent.
-After origo answers, an *outcome* event names the person the token speaks for (`sign_in`
-or `token_refresh`). A token that can't be attributed is never delivered (503). If only
+After origo answers, an *outcome* event names the person the token speaks for by their
+`sub` alone (`sign_in` or `token_refresh`). A token that can't be attributed is never delivered (503). If only
 the outcome can't be recorded, a sign-in gets 503 (a fresh authorization fixes it) and a
 refresh gets its token, logged: origo has already rotated the refresh token, so
 withholding it would end the session.

@@ -2,11 +2,23 @@
 """Append-only audit events, one per tool call, separated per tenant.
 
 File contents are not copied into the audit trail: each committed file is
-recorded by path, size and SHA-256. The commit itself holds the content.
+recorded by size and SHA-256. The commit itself holds the content.
+
+No personal data (Loimi decision-record 49f5331d, 2026-11-01): the events
+ship to an object-locked bucket that nobody can edit for a year, so a
+person is named only by their Keycloak subject (``sub``), never by name,
+email or username, and free text that could contain one (commit messages,
+intents, branch names, paths, refs, error messages) is recorded as a
+SHA-256 and a length. ``redact`` is applied to every event before any sink
+sees it. ``client_ip`` stays the raw address here: the audit-log gateway
+(ieepirzy/infra, flux/audit-log/gateway.yaml) replaces every IP address
+with a keyed hash before the record reaches the bucket, the same hash it
+applies to the API server's sourceIPs.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -15,11 +27,90 @@ import threading
 import time
 import uuid
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from . import validation
 
+if TYPE_CHECKING:
+    from .auth import Principal
+
 log = logging.getLogger("alasin_mcp")
+
+# Fields an event may carry as they are: ids, enums, counts, shas, the repo.
+_KEEP = frozenset(
+    {
+        "event_id",
+        "time",
+        "tenant",
+        "sub",
+        "subject",
+        "phase",
+        "action",
+        "tool",
+        "outcome",
+        "status",
+        "session_id",
+        "trace_id",
+        "span_id",
+        "repo",
+        "commit",
+        "auth_mode",
+        "author_source",
+        "method",
+        "grant_type",
+        "client_id",
+        "client_ip",
+        "error_kind",
+        "arguments",
+        "result",
+    }
+)
+# Never recorded: they name a person.
+_DROP = frozenset({"principal_name", "principal_email", "author", "committer"})
+# Free text naming a ref or a path: recorded as <key>_sha256.
+_HASHED = frozenset({"branch", "from_ref", "ref", "base", "path"})
+
+
+def sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def digest(key: str, text: str) -> dict[str, Any]:
+    """Free text as recorded: ``<key>_sha256`` and ``<key>_chars``, never the
+    text (and never under its own key, so a reader never mistakes it)."""
+    return {f"{key}_sha256": sha256_hex(text), f"{key}_chars": len(text)}
+
+
+def who(principal: Principal) -> dict[str, str]:
+    """The caller as an audit event names them: a person by their Keycloak
+    subject alone; a principal with no person behind it (a static credential,
+    an OAuth client) by its configured subject."""
+    if principal.idp_subject:
+        return {"sub": principal.idp_subject}
+    return {"subject": principal.subject}
+
+
+def redact(event: dict[str, Any]) -> dict[str, Any]:
+    """The event as it is written: no names, emails or free text. Known
+    identifying fields are dropped, refs and paths become ``<key>_sha256``,
+    an error message becomes its digest, and any other text field the code
+    did not declare safe becomes a digest too (fail safe, not open)."""
+    out: dict[str, Any] = {}
+    for key, value in event.items():
+        if key in _DROP or value is None and key in _HASHED:
+            continue
+        if key in _HASHED:
+            out[f"{key}_sha256"] = sha256_hex(str(value))
+        elif key == "error":
+            out.update(digest("error", str(value)))
+            out.setdefault("error_kind", event.get("error_kind") or "error")
+        elif key in _KEEP or value is None or isinstance(value, bool | int | float):
+            out[key] = value
+        elif isinstance(value, str):
+            out.update(digest(key, value))
+        else:
+            out.update(digest(key, json.dumps(value, sort_keys=True, default=str)))
+    return out
 
 
 class AuditSink(Protocol):

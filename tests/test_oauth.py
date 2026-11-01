@@ -273,7 +273,7 @@ async def test_an_unattributable_token_is_never_delivered(monkeypatch: pytest.Mo
     assert tok.status_code == 503, tok.text
     assert "access_token" not in tok.json()
     assert sink.events[-1]["outcome"] == "error"
-    assert sink.events[-1]["error"] == "issued token could not be attributed"
+    assert sink.events[-1]["error_kind"] == "unattributed_token"
 
 
 async def test_client_secret_basic_names_the_client() -> None:
