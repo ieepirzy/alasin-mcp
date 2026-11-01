@@ -318,9 +318,14 @@ class OrigoFrontDoor:
                 if grant_type == "refresh_token":
                     # origo already rotated the refresh token: withholding the
                     # new pair would end the session. The attempt is recorded.
+                    # Who it was goes to stderr at least: the attempt event
+                    # names no person.
                     log.error(
-                        "token refresh outcome could not be recorded; delivering (attempt %s)",
+                        "token refresh outcome could not be recorded; delivering "
+                        "(attempt %s, subject %s, client %s)",
                         base["event_id"],
+                        principal.subject,
+                        client_id or "-",
                     )
                     return response
                 log.error("sign-in outcome could not be recorded; withholding the token")

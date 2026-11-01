@@ -223,7 +223,9 @@ async def test_a_failed_sign_in_outcome_withholds_the_token() -> None:
     assert attempt["phase"] == "attempt"
 
 
-async def test_a_failed_refresh_outcome_delivers_and_keeps_the_family() -> None:
+async def test_a_failed_refresh_outcome_delivers_and_keeps_the_family(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """origo rotates the refresh token before alasin sees the outcome: a
     refresh whose outcome cannot be recorded is delivered (logged), so the
     client keeps a working refresh token instead of a spent one."""
@@ -251,6 +253,12 @@ async def test_a_failed_refresh_outcome_delivers_and_keeps_the_family() -> None:
             assert await list_tools(base + "/mcp", third.json()["access_token"])
     refreshes = [e for e in sink.events if e["action"] == "token_refresh"]
     assert [e["phase"] for e in refreshes] == ["attempt", "attempt", "outcome"]
+    # The person is on stderr even though the outcome event was not written.
+    assert any(
+        "token refresh outcome could not be recorded" in r.getMessage()
+        and "oauth:" + CLIENT in r.getMessage()
+        for r in caplog.records
+    )
 
 
 async def test_an_unattributable_token_is_never_delivered(monkeypatch: pytest.MonkeyPatch) -> None:
