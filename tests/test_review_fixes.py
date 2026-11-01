@@ -12,6 +12,7 @@ import threading
 import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,7 +22,12 @@ from starlette.requests import Request
 
 from alasin_mcp import validation
 from alasin_mcp.app import build_app
-from alasin_mcp.audit import AuditUnavailable, FanoutAuditSink, MemoryAuditSink
+from alasin_mcp.audit import (
+    AuditUnavailable,
+    FanoutAuditSink,
+    JsonlAuditSink,
+    MemoryAuditSink,
+)
 from alasin_mcp.auth import (
     PRINCIPAL_SCOPE_KEY,
     BearerAuthMiddleware,
@@ -171,6 +177,99 @@ def test_fanout_tries_every_sink_then_raises() -> None:
     with pytest.raises(AuditUnavailable):
         fan.emit({"phase": "outcome", "tenant": "t"})
     assert second.events == [{"phase": "outcome", "tenant": "t"}]
+
+
+def test_fanout_best_effort_sink_never_refuses() -> None:
+    # Fail closed on the local JSONL write only: a broken stderr copy must not
+    # refuse a write the durable record holds.
+    required, broken = MemoryAuditSink(), FailingSink("attempt")
+    FanoutAuditSink([required], best_effort=[broken]).emit({"phase": "attempt", "tenant": "t"})
+    assert required.events == [{"phase": "attempt", "tenant": "t"}]
+
+
+def test_fanout_required_sink_still_refuses_beside_a_working_best_effort() -> None:
+    copy = MemoryAuditSink()
+    fan = FanoutAuditSink([FailingSink("attempt")], best_effort=[copy])
+    with pytest.raises(AuditUnavailable):
+        fan.emit({"phase": "attempt", "tenant": "t"})
+    assert copy.events == [{"phase": "attempt", "tenant": "t"}]
+
+
+def test_jsonl_sink_fsyncs_the_line_and_each_new_directory_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synced: list[str] = []
+    real_fsync = os.fsync
+
+    def fsync(fd: int) -> None:
+        synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    sink = JsonlAuditSink(str(tmp_path))
+    sink.emit({"tenant": "t", "n": 1})
+    [day_file] = list((tmp_path / "t").glob("audit-*.jsonl"))
+    # The line, then the tenant folder (new file), then the root (new folder).
+    assert synced == [str(day_file), str(tmp_path / "t"), str(tmp_path)]
+    synced.clear()
+    sink.emit({"tenant": "t", "n": 2})
+    # An append to an existing file adds no directory entry.
+    assert synced == [str(day_file)]
+    assert [json.loads(x)["n"] for x in day_file.read_text().splitlines()] == [1, 2]
+
+
+def test_jsonl_sink_raises_when_the_line_cannot_be_made_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fsync(fd: int) -> None:
+        raise OSError("EIO")
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with pytest.raises(OSError):
+        JsonlAuditSink(str(tmp_path)).emit({"tenant": "t"})
+
+
+def _peer_request(peer: str, headers: dict[str, str] | None = None) -> Request:
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    return Request({"type": "http", "headers": raw, "client": (peer, 1234)})
+
+
+def test_client_ip_header_is_believed_only_from_a_trusted_proxy() -> None:
+    from alasin_mcp.clientip import ClientIpPolicy
+
+    policy = ClientIpPolicy.from_config("CF-Connecting-IP", ["10.244.0.0/16"])
+    tunnel = _peer_request("10.244.3.7", {"CF-Connecting-IP": "203.0.113.9"})
+    assert policy.client_ip(tunnel) == "203.0.113.9"
+    # Anyone else cannot choose the recorded address.
+    outsider = _peer_request("192.0.2.1", {"CF-Connecting-IP": "203.0.113.9"})
+    assert policy.client_ip(outsider) == "192.0.2.1"
+    # A trusted proxy with no header, or garbage: the peer, never the raw value.
+    assert policy.client_ip(_peer_request("10.244.3.7")) == "10.244.3.7"
+    bad = _peer_request("10.244.3.7", {"CF-Connecting-IP": "1.2.3.4, 5.6.7.8"})
+    assert policy.client_ip(bad) == "10.244.3.7"
+    # Unconfigured: the peer.
+    assert ClientIpPolicy().client_ip(tunnel) == "10.244.3.7"
+
+
+def test_audit_dir_is_created_at_startup_and_its_entry_made_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synced: list[str] = []
+    real_fsync = os.fsync
+
+    def fsync(fd: int) -> None:
+        synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    target = tmp_path / "state" / "audit"
+    (tmp_path / "state").mkdir()
+    JsonlAuditSink(str(target)).ensure_dir()
+    assert target.is_dir()
+    assert synced == [str(tmp_path / "state")]
+    synced.clear()
+    JsonlAuditSink(str(target)).ensure_dir()  # already there: nothing to sync
+    assert synced == []
 
 
 async def test_cancelled_call_still_records_its_outcome() -> None:

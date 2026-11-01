@@ -35,6 +35,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
 
+import anyio
 import httpx
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -53,6 +54,7 @@ from .branching import (
     BranchRequest,
     WebhookBranchCreator,
 )
+from .clientip import ClientIpPolicy
 from .config import AuthMode, AuthorSource, TenantConfig
 from .credentials import (
     AuthorizationRequired,
@@ -141,8 +143,9 @@ class Call:
     def client(self, cred: ForgejoCredential) -> ForgejoClient:
         return ForgejoClient(self.tenant.api_base, cred.token, transport=self.services.transport)
 
-    def record_attempt(self, action: str, **details: Any) -> None:
-        """Write an attempt event before a mutating call; refuse the write if it fails."""
+    async def record_attempt(self, action: str, **details: Any) -> None:
+        """Write an attempt event before a mutating call; refuse the write if it fails.
+        The fsyncing write runs in a worker thread, off the event loop."""
         event = {
             **self.audit,
             **new_event(),
@@ -151,7 +154,7 @@ class Call:
             **details,
         }
         try:
-            self.services.audit_sink.emit(event)
+            await anyio.to_thread.run_sync(self.services.audit_sink.emit, event)
         except Exception as e:
             log.error("audit attempt event could not be recorded; refusing %s", action)
             raise AuditUnavailable("the audit trail is unavailable; the write was not made") from e
@@ -218,6 +221,8 @@ class Services:
     # Tenant id -> the groups whose members may use the write tools (the
     # identity provider's allowed_groups). Tenants not listed have no gate.
     writer_groups: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Which address an audit event records for the caller (clientip.py).
+    client_ip: ClientIpPolicy = field(default_factory=ClientIpPolicy)
 
     def check_writer(self, tenant: TenantConfig, principal: Principal) -> None:
         """The per-write lane gate. Sign-in checked the groups once; this
@@ -262,13 +267,12 @@ class Services:
             tenant = self.resolver.resolve(principal)
         except UnknownTenant:
             raise ToolError("the caller's tenant is not configured on this server") from None
-        client = request.client if isinstance(request, Request) else None
         event = new_event(
             tenant=principal.tenant,
             subject=principal.subject,
             principal_name=principal.name,
             principal_email=principal.email,
-            client_ip=client.host if client else None,
+            client_ip=self.client_ip.client_ip(request if isinstance(request, Request) else None),
             tool=tool,
             session_id=session_id,
             arguments=_audit_arguments(arguments),
@@ -276,20 +280,20 @@ class Services:
         try:
             self.limiter.check(tenant.id, tenant.rate_limit_per_minute)
         except RateLimited as e:
-            self._finish(event, None, error=str(e))
+            await self._finish(event, None, error=str(e))
             raise ToolError(str(e)) from None
         session = None
         if session_id is not None:
             session = self.store.get_session(tenant.id, principal.subject, session_id)
             if session is None:
                 msg = "unknown or expired session_id; call begin_change first"
-                self._finish(event, None, error=msg)
+                await self._finish(event, None, error=msg)
                 raise ToolError(msg)
         if tool in WRITE_TOOLS:
             try:
                 self.check_writer(tenant, principal)
             except PolicyError as e:
-                self._finish(event, None, error=str(e))
+                await self._finish(event, None, error=str(e))
                 raise ToolError(str(e)) from None
         session_trace = (session.trace_id, session.span_id) if session else None
         attrs = {
@@ -338,11 +342,11 @@ class Services:
                     if event.get(key) is not None:
                         span.set_attribute(f"alasin.{key}", str(event[key]))
                 summary = _result_summary(result) if result is not None else None
-                self._finish(event, span, result=summary, error=error)
+                await self._finish(event, span, result=summary, error=error)
             assert result is not None
             return result
 
-    def _finish(
+    async def _finish(
         self,
         event: dict[str, Any],
         span: Any,
@@ -362,7 +366,9 @@ class Services:
         if result is not None:
             event["result"] = result
         try:
-            self.audit_sink.emit(event)
+            # Shielded: a cancelled call still records its outcome.
+            with anyio.CancelScope(shield=True):
+                await anyio.to_thread.run_sync(self.audit_sink.emit, event)
         except Exception:
             log.exception("audit outcome event could not be recorded: %s", event["event_id"])
 
@@ -885,7 +891,7 @@ def build_server(services: Services) -> MCPServer:
                     raise PolicyError(f"branch '{name}' already exists")
                 source = validation.ref(from_ref) if from_ref else str(info["default_branch"])
                 creator = call.services.branch_creator(call.tenant)
-                call.record_attempt(
+                await call.record_attempt(
                     "create_branch",
                     branch=name,
                     from_ref=source,
@@ -999,7 +1005,7 @@ def build_server(services: Services) -> MCPServer:
                 author, committer, source = await resolve_author(
                     call, client, cred, author_name or None, author_email or None
                 )
-                call.record_attempt(
+                await call.record_attempt(
                     "commit_files",
                     branch=name,
                     author=str(author) if author else None,
