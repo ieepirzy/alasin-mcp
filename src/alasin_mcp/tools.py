@@ -161,8 +161,15 @@ class Call:
 
     def check_repo(self, raw: str) -> RepoRef:
         repo = validation.repo(raw)
-        self.audit["repo"] = repo.full_name
-        if not repo_allowed(self.tenant, repo.full_name):
+        allowed = repo_allowed(self.tenant, repo.full_name)
+        # Written by name only when the configuration names its owner (an
+        # org): otherwise the caller chose the owner, which can be a person's
+        # login, so only its digest is written.
+        if allowed and owner_configured(self.tenant, repo.full_name):
+            self.audit["repo"] = repo.full_name
+        else:
+            self.audit["repo_sha256"] = sha256_hex(repo.full_name)
+        if not allowed:
             raise PolicyError(f"repository {repo.full_name} is not available to this tenant")
         return repo
 
@@ -194,6 +201,15 @@ def is_ci_path(tenant: TenantConfig, path: str) -> bool:
 def repo_allowed(tenant: TenantConfig, full_name: str) -> bool:
     name = full_name.casefold()
     return any(fnmatch.fnmatchcase(name, pat.casefold()) for pat in tenant.repos)
+
+
+def owner_configured(tenant: TenantConfig, full_name: str) -> bool:
+    """Whether a pattern that admits ``full_name`` names its owner literally."""
+    name = full_name.casefold()
+    return any(
+        fnmatch.fnmatchcase(name, pat.casefold()) and not set(pat.partition("/")[0]) & set("*?[")
+        for pat in tenant.repos
+    )
 
 
 def canonical_repo(repo: RepoRef, info: dict[str, Any]) -> RepoRef:
@@ -394,7 +410,7 @@ def _error_kind(e: BaseException) -> str:
 
 def _audit_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     """Arguments as recorded, with no personal data or free text: the repo as
-    given; intents and messages as ``<key>_sha256`` and ``<key>_chars``; branches, refs and
+    its SHA-256; intents and messages as ``<key>_sha256`` and ``<key>_chars``; branches, refs and
     paths as ``<key>_sha256``; author arguments only as whether they were
     given; file contents as size and SHA-256, file paths as their SHA-256."""
     out: dict[str, Any] = {}
@@ -405,8 +421,12 @@ def _audit_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
             )
         elif key == "files":
             out["files"] = [_audit_file(f) for f in value] if isinstance(value, list) else None
-        elif key == "repo" or value is None or isinstance(value, bool | int | float):
+        elif value is None or isinstance(value, bool | int | float):
             out[key] = value
+        elif key == "repo":
+            # As typed, before it is checked: only its digest. The event's
+            # own `repo` is the checked one, and only for the tenant's repos.
+            out["repo_sha256"] = sha256_hex(str(value))
         elif key in ("branch", "ref", "base", "from_ref", "path"):
             if value:
                 out[f"{key}_sha256"] = sha256_hex(str(value))

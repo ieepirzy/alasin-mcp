@@ -62,7 +62,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from .audit import AuditSink, new_event, redact, who
+from .audit import AuditSink, known_client_ids, new_event, redact, who
 from .auth import Principal, TokenVerifier
 from .clientip import ClientIpPolicy
 from .config import (
@@ -202,6 +202,7 @@ class OrigoFrontDoor:
     ):
         self._tenant = cfg.tenant
         self._audit_sink = audit_sink
+        known_client_ids(c.id for c in cfg.clients)
         self._client_ip = client_ip or ClientIpPolicy()
         try:
             from origo import OAuthProvider

@@ -11,6 +11,7 @@ scanner walks every event they wrote."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -225,3 +226,98 @@ async def test_sign_in_and_refresh_record_the_sub_and_no_personal_data(
     # client_ip stays raw here; the infra gateway hashes it before the bucket.
     assert all(e["client_ip"] == "127.0.0.1" for e in sink.events)
     assert "ilari@example.com" not in json.dumps(sink.events)
+
+
+# -- values a caller chooses ----------------------------------------------------------
+# The /token form and Basic header are read before origo authenticates
+# anything, and a tool call's session_id and repo before they are checked:
+# anyone who can reach the server chooses them. None may carry a person.
+
+HOSTILE = ("Ilari Testinen <ilari.testinen@example.fi>", "ilari.testinen@example.fi")
+
+
+def test_redact_keeps_caller_values_only_in_their_own_shape() -> None:
+    for bad in HOSTILE:
+        e = redact(
+            {
+                "client_id": bad,
+                "grant_type": bad,
+                "session_id": bad,
+                "repo": bad,
+                "client_ip": bad,
+                "trace_id": bad,
+                "arguments": {"repo": bad, "session_id": bad, "nested": {"x": bad}, "l": [bad]},
+                "result": {"url": bad, "commit": bad},
+            }
+        )
+        assert pii_findings(e) == [], (bad, pii_findings(e))
+        assert "client_id" not in e and "grant_type" not in e and "session_id" not in e
+    good = redact(
+        {
+            "client_id": "A" * 22,
+            "grant_type": "refresh_token",
+            "session_id": "ws_" + "a" * 24,
+            "repo": "acme/site",
+            "client_ip": "2a01:4f8::7",
+            "trace_id": "0" * 32,
+            "arguments": {"files": [{"path_sha256": "0" * 64, "encoding": "utf-8"}]},
+        }
+    )
+    assert good["client_id"] == "A" * 22 and good["grant_type"] == "refresh_token"
+    assert good["session_id"] == "ws_" + "a" * 24 and good["repo"] == "acme/site"
+    assert good["client_ip"] == "2a01:4f8::7" and good["trace_id"] == "0" * 32
+    assert good["arguments"]["files"][0] == {"path_sha256": "0" * 64, "encoding": "utf-8"}
+
+
+async def test_a_hostile_token_request_leaves_no_personal_data() -> None:
+    """client_id and grant_type straight from the internet, form and Basic."""
+    sink = MemoryAuditSink()
+    with test_oauth.running(sink) as base:
+        async with httpx.AsyncClient(timeout=10) as h:
+            for bad in HOSTILE:
+                r = await h.post(
+                    f"{base}/token",
+                    data={"grant_type": bad, "client_id": bad, "client_secret": "x", "code": "c"},
+                )
+                assert r.status_code != 200
+                basic = base64.b64encode(f"{bad}:x".encode()).decode()
+                r = await h.post(
+                    f"{base}/token",
+                    data={"grant_type": "authorization_code", "code": "c"},
+                    headers={"Authorization": f"Basic {basic}"},
+                )
+                assert r.status_code != 200
+            # The configured client is still named as it is.
+            r = await h.post(
+                f"{base}/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": "spent",
+                    "client_id": test_oauth.CLIENT,
+                    "client_secret": test_oauth.SECRET,
+                },
+            )
+    assert len(sink.events) >= 8
+    assert_no_pii(sink.events)
+    assert any(e.get("client_id") == test_oauth.CLIENT for e in sink.events)
+    assert any("client_id_sha256" in e for e in sink.events)
+    assert any("grant_type_sha256" in e for e in sink.events)
+
+
+async def test_a_hostile_session_id_and_repo_leave_no_personal_data() -> None:
+    with people() as p:
+        sink: MemoryAuditSink = p.services.audit_sink
+        sid = await p.sid("alice")
+        for bad in HOSTILE:
+            bad_sid = {"session_id": bad, "repo": "acme/site", "branch": "lane/alice"}
+            assert (await call_tool(p.url, "alice", "create_branch", bad_sid)).is_error
+            bad_repo = {"session_id": sid, "repo": bad, "branch": "lane/alice"}
+            assert (await call_tool(p.url, "alice", "create_branch", bad_repo)).is_error
+        # owner/name-shaped but not the tenant's: a login could be the owner.
+        other = {"session_id": sid, "repo": "ilari-testinen/notes", "branch": "lane/alice"}
+        assert (await call_tool(p.url, "alice", "create_branch", other)).is_error
+    events = sink.events
+    assert_no_pii(events)
+    assert "ilari-testinen" not in json.dumps(events)
+    assert all(e.get("repo") in (None, "acme/site") for e in events)
+    assert all(e.get("session_id") in (None, sid) for e in events)
