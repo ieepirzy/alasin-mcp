@@ -45,7 +45,7 @@ from pydantic import BaseModel, Field
 from starlette.requests import Request
 
 from . import telemetry, validation
-from .audit import AuditSink, AuditUnavailable, new_event
+from .audit import AuditSink, AuditUnavailable, digest, new_event, redact, sha256_hex, who
 from .auth import PRINCIPAL_SCOPE_KEY, Principal
 from .branching import (
     ApiBranchCreator,
@@ -154,15 +154,22 @@ class Call:
             **details,
         }
         try:
-            await anyio.to_thread.run_sync(self.services.audit_sink.emit, event)
+            await anyio.to_thread.run_sync(self.services.audit_sink.emit, redact(event))
         except Exception as e:
             log.error("audit attempt event could not be recorded; refusing %s", action)
             raise AuditUnavailable("the audit trail is unavailable; the write was not made") from e
 
     def check_repo(self, raw: str) -> RepoRef:
         repo = validation.repo(raw)
-        self.audit["repo"] = repo.full_name
-        if not repo_allowed(self.tenant, repo.full_name):
+        allowed = repo_allowed(self.tenant, repo.full_name)
+        # Written by name only when the configuration names its owner (an
+        # org): otherwise the caller chose the owner, which can be a person's
+        # login, so only its digest is written.
+        if allowed and owner_configured(self.tenant, repo.full_name):
+            self.audit["repo"] = repo.full_name
+        else:
+            self.audit["repo_sha256"] = sha256_hex(repo.full_name)
+        if not allowed:
             raise PolicyError(f"repository {repo.full_name} is not available to this tenant")
         return repo
 
@@ -194,6 +201,15 @@ def is_ci_path(tenant: TenantConfig, path: str) -> bool:
 def repo_allowed(tenant: TenantConfig, full_name: str) -> bool:
     name = full_name.casefold()
     return any(fnmatch.fnmatchcase(name, pat.casefold()) for pat in tenant.repos)
+
+
+def owner_configured(tenant: TenantConfig, full_name: str) -> bool:
+    """Whether a pattern that admits ``full_name`` names its owner literally."""
+    name = full_name.casefold()
+    return any(
+        fnmatch.fnmatchcase(name, pat.casefold()) and not set(pat.partition("/")[0]) & set("*?[")
+        for pat in tenant.repos
+    )
 
 
 def canonical_repo(repo: RepoRef, info: dict[str, Any]) -> RepoRef:
@@ -269,9 +285,7 @@ class Services:
             raise ToolError("the caller's tenant is not configured on this server") from None
         event = new_event(
             tenant=principal.tenant,
-            subject=principal.subject,
-            principal_name=principal.name,
-            principal_email=principal.email,
+            **who(principal),
             client_ip=self.client_ip.client_ip(request if isinstance(request, Request) else None),
             tool=tool,
             session_id=session_id,
@@ -280,20 +294,23 @@ class Services:
         try:
             self.limiter.check(tenant.id, tenant.rate_limit_per_minute)
         except RateLimited as e:
-            await self._finish(event, None, error=str(e))
+            await self._finish(event, None, error=str(e), error_kind="rate_limited")
             raise ToolError(str(e)) from None
         session = None
         if session_id is not None:
             session = self.store.get_session(tenant.id, principal.subject, session_id)
             if session is None:
+                # Not a session of this caller's: their own text, not an id.
+                event.pop("session_id", None)
+                event.update(digest("session_id", session_id))
                 msg = "unknown or expired session_id; call begin_change first"
-                await self._finish(event, None, error=msg)
+                await self._finish(event, None, error=msg, error_kind="unknown_session")
                 raise ToolError(msg)
         if tool in WRITE_TOOLS:
             try:
                 self.check_writer(tenant, principal)
             except PolicyError as e:
-                await self._finish(event, None, error=str(e))
+                await self._finish(event, None, error=str(e), error_kind="writer_gate")
                 raise ToolError(str(e)) from None
         session_trace = (session.trace_id, session.span_id) if session else None
         attrs = {
@@ -311,9 +328,10 @@ class Services:
             call = Call(self, principal, tenant, session, request, audit=event)
             result: dict[str, Any] | None = None
             error: str | None = "internal error: incomplete"
+            error_kind: str | None = "internal"
             try:
                 result = await body(call)
-                error = None
+                error = error_kind = None
             except (
                 InvalidInput,
                 PolicyError,
@@ -321,28 +339,31 @@ class Services:
                 AuditUnavailable,
                 BranchCreationError,
             ) as e:
-                error = _loggable(e)
+                error, error_kind = _loggable(e), _error_kind(e)
                 raise ToolError(str(e)) from None
             except ForgejoError as e:
-                error = str(e)
+                error, error_kind = str(e), "forgejo"
                 raise ToolError(str(e)) from None
             except httpx.HTTPError as e:
                 error = f"could not reach an upstream service: {type(e).__name__}"
+                error_kind = "upstream_unreachable"
                 raise ToolError(error) from None
             except BaseException as e:
                 # Including cancellation: the outcome is recorded either way.
-                error = (
-                    "cancelled"
-                    if isinstance(e, asyncio.CancelledError)
-                    else f"internal error: {type(e).__name__}"
-                )
+                cancelled = isinstance(e, asyncio.CancelledError)
+                error = "cancelled" if cancelled else f"internal error: {type(e).__name__}"
+                error_kind = "cancelled" if cancelled else "internal"
                 raise
             finally:
                 for key in ("repo", "branch", "commit", "author", "committer"):
                     if event.get(key) is not None:
                         span.set_attribute(f"alasin.{key}", str(event[key]))
-                summary = _result_summary(result) if result is not None else None
-                await self._finish(event, span, result=summary, error=error)
+                summary = (
+                    _result_summary(result, owner_named="repo" in event)
+                    if result is not None
+                    else None
+                )
+                await self._finish(event, span, result=summary, error=error, error_kind=error_kind)
             assert result is not None
             return result
 
@@ -353,6 +374,7 @@ class Services:
         *,
         result: dict[str, Any] | None = None,
         error: str | None = None,
+        error_kind: str | None = None,
     ) -> None:
         """Record the outcome. Never raises: a write may already have landed, and
         failing the call now would invite a retry that duplicates it. The attempt
@@ -361,6 +383,7 @@ class Services:
         event["outcome"] = "error" if error else "ok"
         if error:
             event["error"] = error
+            event["error_kind"] = error_kind or "error"
             if span is not None:
                 span.set_status(StatusCode.ERROR, error)
         if result is not None:
@@ -368,7 +391,7 @@ class Services:
         try:
             # Shielded: a cancelled call still records its outcome.
             with anyio.CancelScope(shield=True):
-                await anyio.to_thread.run_sync(self.audit_sink.emit, event)
+                await anyio.to_thread.run_sync(self.audit_sink.emit, redact(event))
         except Exception:
             log.exception("audit outcome event could not be recorded: %s", event["event_id"])
 
@@ -380,37 +403,98 @@ def _loggable(e: BaseException) -> str:
     return str(e)
 
 
+def _error_kind(e: BaseException) -> str:
+    """A fixed category for an error: the audit records this, and the
+    message only as a digest (a message can quote input)."""
+    return {
+        InvalidInput: "invalid_input",
+        PolicyError: "policy",
+        CredentialError: "credential",
+        AuditUnavailable: "audit_unavailable",
+        BranchCreationError: "branch_creation",
+    }.get(type(e), "error")
+
+
 def _audit_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    """Arguments as recorded: file contents replaced by size and SHA-256."""
-    out = dict(arguments)
-    files = out.get("files")
-    if isinstance(files, list):
-        recorded = []
-        for f in files:
-            if isinstance(f, FileChange):
-                data = f.content.encode()
-                recorded.append(
-                    {
-                        "path": f.path,
-                        "encoding": f.encoding,
-                        "content_bytes": len(data),
-                        "content_sha256": hashlib.sha256(data).hexdigest(),
-                    }
-                )
-        out["files"] = recorded
+    """Arguments as recorded, with no personal data or free text: the repo as
+    its SHA-256; intents and messages as ``<key>_sha256`` and ``<key>_chars``; branches, refs and
+    paths as ``<key>_sha256``; author arguments only as whether they were
+    given; file contents as size and SHA-256, file paths as their SHA-256."""
+    out: dict[str, Any] = {}
+    for key, value in arguments.items():
+        if key in ("author_name", "author_email"):
+            out["author_given"] = bool(
+                arguments.get("author_name") or arguments.get("author_email")
+            )
+        elif key == "files":
+            out["files"] = [_audit_file(f) for f in value] if isinstance(value, list) else None
+        elif value is None or isinstance(value, bool | int | float):
+            out[key] = value
+        elif key == "repo":
+            # As typed, before it is checked: only its digest. The event's
+            # own `repo` is the checked one, and only for the tenant's repos.
+            out["repo_sha256"] = sha256_hex(str(value))
+        elif key in ("branch", "ref", "base", "from_ref", "path"):
+            if value:
+                out[f"{key}_sha256"] = sha256_hex(str(value))
+        else:
+            out.update(digest(key, str(value)))
     return out
 
 
-def _result_summary(result: dict[str, Any]) -> dict[str, Any]:
-    """The result as recorded: scalars kept, large values summarised."""
+def _audit_file(f: Any) -> dict[str, Any]:
+    if not isinstance(f, FileChange):
+        return {}
+    data = f.content.encode()
+    return {
+        "path_sha256": sha256_hex(f.path),
+        "encoding": f.encoding,
+        "content_bytes": len(data),
+        "content_sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+# Result values recorded as they are: ids, shas, counts, flags, the commit URL.
+_RESULT_KEEP = frozenset(
+    {
+        "session_id",
+        "trace_id",
+        "expires_at",
+        "commit",
+        "sha",
+        "merge_base",
+        "url",
+        "size",
+        "encoding",
+        "truncated",
+        "files_changed",
+    }
+)
+
+
+def _result_summary(result: dict[str, Any], *, owner_named: bool = False) -> dict[str, Any]:
+    """The result as recorded: ids, shas, counts and flags kept; lists as
+    their length; author and committer left out; any other text (paths,
+    branches, messages, file contents) as ``<key>_sha256`` and ``<key>_chars``.
+    A URL names the repo's owner, so it is kept only when the event names the
+    repo itself (``owner_named``: the configuration names that owner)."""
     out: dict[str, Any] = {}
     for k, v in result.items():
+        if k in ("author", "committer"):
+            continue  # people; the commit records them
+        if k == "url" and not owner_named and isinstance(v, str):
+            out.update(digest(k, v))
+            continue
         if isinstance(v, list):
             out[k] = {"count": len(v)}
-        elif isinstance(v, str) and len(v) > 300:
-            out[k] = {"chars": len(v)}
-        else:
+        elif v is None or isinstance(v, bool | int | float):
             out[k] = v
+        elif k in _RESULT_KEEP and isinstance(v, str) and len(v) <= 300:
+            out[k] = v
+        elif isinstance(v, str):
+            out.update(digest(k, v))
+        else:
+            out[k] = {"keys": len(v) if isinstance(v, dict) else 0}
     return out
 
 
@@ -1005,12 +1089,9 @@ def build_server(services: Services) -> MCPServer:
                 author, committer, source = await resolve_author(
                     call, client, cred, author_name or None, author_email or None
                 )
-                await call.record_attempt(
-                    "commit_files",
-                    branch=name,
-                    author=str(author) if author else None,
-                    committer=str(committer) if committer else None,
-                )
+                # The attempt names no author or committer: they are people
+                # (the commit itself records them).
+                await call.record_attempt("commit_files", branch=name, author_source=source)
                 result = await client.change_files(
                     r,
                     name,

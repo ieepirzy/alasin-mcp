@@ -291,7 +291,7 @@ async def test_cancelled_call_still_records_its_outcome() -> None:
     with pytest.raises(asyncio.CancelledError):
         await services.call(ctx, "begin_change", {}, None, body)
     assert sink.events[-1]["outcome"] == "error"
-    assert sink.events[-1]["error"] == "cancelled"
+    assert sink.events[-1]["error_kind"] == "cancelled"
     # 10: the client address is recorded.
     assert sink.events[-1]["client_ip"] == "192.0.2.7"
 

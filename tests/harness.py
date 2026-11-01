@@ -221,7 +221,15 @@ class FakeForgejo:
             committer = body.get("committer") or author
             repo.commits.append(body)
             return httpx.Response(
-                201, json={"commit": {"sha": sha, "author": author, "committer": committer}}
+                201,
+                json={
+                    "commit": {
+                        "sha": sha,
+                        "author": author,
+                        "committer": committer,
+                        "html_url": f"https://{request.url.host}/{full}/commit/{sha}",
+                    }
+                },
             )
         if rest[0] == "contents" and request.method == "GET":
             files = repo.branches.get(ref, {})

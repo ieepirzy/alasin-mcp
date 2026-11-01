@@ -62,7 +62,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from .audit import AuditSink, new_event
+from .audit import AuditSink, known_client_ids, new_event, redact, who
 from .auth import Principal, TokenVerifier
 from .clientip import ClientIpPolicy
 from .config import (
@@ -202,6 +202,7 @@ class OrigoFrontDoor:
     ):
         self._tenant = cfg.tenant
         self._audit_sink = audit_sink
+        known_client_ids(c.id for c in cfg.clients)
         self._client_ip = client_ip or ClientIpPolicy()
         try:
             from origo import OAuthProvider
@@ -259,8 +260,8 @@ class OrigoFrontDoor:
         sink = self._audit_sink
         assert sink is not None
 
-        async def emit(event: dict[str, Any]) -> None:
-            await anyio.to_thread.run_sync(sink.emit, event)
+        async def emit(event: dict[str, Any], trusted: frozenset[str] = frozenset()) -> None:
+            await anyio.to_thread.run_sync(sink.emit, redact(event, trusted=trusted))
 
         async def token(request: Request) -> Response:
             form = await _read_token_form(request)
@@ -287,6 +288,7 @@ class OrigoFrontDoor:
             outcome = {**base, **new_event(), "phase": "outcome", "status": response.status_code}
             if response.status_code != 200:
                 outcome["outcome"] = "error"
+                outcome["error_kind"] = "token_refused"
                 try:
                     await emit(outcome)
                 except Exception:
@@ -297,7 +299,7 @@ class OrigoFrontDoor:
             principal = await self._issued_principal(response)
             if principal is None:
                 # A 200 whose token we cannot attribute: never delivered.
-                outcome.update(outcome="error", error="issued token could not be attributed")
+                outcome.update(outcome="error", error_kind="unattributed_token")
                 try:
                     await emit(outcome)
                 except Exception:
@@ -308,12 +310,12 @@ class OrigoFrontDoor:
                 )
             outcome.update(
                 outcome="ok",
-                subject=principal.subject,
-                principal_name=principal.name,
-                principal_email=principal.email,
+                **who(principal),
             )
             try:
-                await emit(outcome)
+                # origo issued a token to this client and it was attributed:
+                # the client id is origo's, not just whatever the form said.
+                await emit(outcome, trusted=frozenset({"client_id"}))
             except Exception:
                 if grant_type == "refresh_token":
                     # origo already rotated the refresh token: withholding the

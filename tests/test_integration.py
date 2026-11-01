@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -173,10 +174,12 @@ async def test_full_change_flow(forgejo, monkeypatch, spans) -> None:
     )
     events = [e for e in audit.events if e["tool"] == "commit_files" and e.get("outcome") == "ok"]
     assert events[0]["commit"] == c["commit"]
-    assert events[0]["branch"] == "lane/copy" and events[0]["repo"] == "acme/site"
+    # No branch name in the audit trail (Loimi 49f5331d): its SHA-256 only.
+    assert "branch" not in events[0] and events[0]["repo"] == "acme/site"
+    assert events[0]["branch_sha256"] == hashlib.sha256(b"lane/copy").hexdigest()
     assert events[0]["trace_id"] == s["trace_id"]
     recorded = events[0]["arguments"]["files"]
-    assert all("content" not in f and f["content_sha256"] for f in recorded)
+    assert all("content" not in f and "path" not in f and f["content_sha256"] for f in recorded)
     # One work session is one trace.
     tool_spans = [x for x in spans.get_finished_spans() if x.name.startswith("alasin.")]
     assert tool_spans and {format(x.context.trace_id, "032x") for x in tool_spans} == {
