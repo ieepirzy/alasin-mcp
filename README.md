@@ -37,6 +37,7 @@ structured result twice (text and `structuredContent`), so each copy stays under
 | `diff_branch` | read | A branch's commits and a unified diff per file against the default branch (or `base`), from the merge base. At most 100 commits (their messages within a quarter of the budget), 50 files, and diffs within the rest; `commit_count`, `files_changed` and `truncated` say what was left out. |
 | `create_branch` | write | A new branch from the default branch (or `from_ref`). |
 | `commit_files` | write | One commit with several files (`POST /repos/{owner}/{repo}/contents`), each created or replaced in full. |
+| `git_access` | write | Plain git for one of your work branches (tenants with `[tenants.git_access]`): makes the branch for you when none is given (or checks you own the one named) and returns a `clone_url` with a short-lived credential in it, `expires_at`, the `git_config` to commit with (your name and email) and short instructions. See *Plain git*. |
 
 Not provided, by design: merging, deleting branches, files or repositories, repository
 settings, administration, webhooks and Actions secrets. File deletion and renames are
@@ -54,6 +55,63 @@ Alasin-Session: ws_7ZBUuDKkAf-wwjrEiPQ15Uz5
 
 The model can't set `Trace-Id` or `Alasin-Session` itself; a message containing them is
 refused.
+
+## Plain git
+
+For a client with a real shell and git (claude.ai's code sandbox, for one),
+`git_access` turns a work branch into an ordinary git remote:
+
+```
+git clone --branch lane/change-1a2b3c4d https://x-token:<credential>@alasin.example.com/git/acme/site.git
+git config user.name "Jane Doe"; git config user.email jane@example.com   # from git_config
+# edit, git commit ...
+git push origin lane/change-1a2b3c4d
+```
+
+- **The credential** is random (32 bytes), stored only as its SHA-256, and valid for
+  `ttl_seconds` (15 minutes by default) for one person, one repository and one branch.
+  It **reads the whole repository** (every branch, as clone and fetch do) by design, and
+  **pushes only that branch**.
+  It sits in the URL's user part, so git sends it as HTTP Basic auth and it never appears
+  in a request path or an access log. When it expires, call `git_access` again and
+  `git remote set-url origin <new clone_url>`.
+- **Routes:** only git's smart HTTP under `/git/<owner>/<repo>.git/`: `info/refs`
+  (exactly one `service`, `git-upload-pack` or `git-receive-pack`), `git-upload-pack`
+  and `git-receive-pack`. No dumb HTTP, no LFS. The client's query string is never
+  forwarded; the server builds `?service=` itself. A missing or expired credential gets
+  `401` with a Basic challenge; one client address may fail 30 times a minute before it
+  gets `429` (successes don't count: sandboxes share addresses).
+- **Forwarding:** to the tenant's Forgejo with the tenant's service token (re-read on
+  every request); the caller's credential never leaves the server. Request and response
+  bodies are streamed; a push is capped at `max_push_bytes`.
+- **Pushes are checked before anything reaches Forgejo.** Every ref command must update
+  exactly `refs/heads/<the credential's branch>`: no other branch, no tag, no new
+  branch, no deletion, no shallow or signed pushes. Capabilities are an allowlist
+  (`report-status`, `report-status-v2`, `side-band-64k`, `side-band`, `quiet`, `atomic`,
+  `ofs-delta`, `agent`, `object-format`, `session-id`, by name before any `=`): push
+  options in particular are refused, because Forgejo applies options such as
+  `repo.private` as the pusher, the service account. The branch's owner is checked again
+  at every push. A refused push is
+  answered in git's report-status format, so git prints
+  `! [remote rejected] ... (<reason>)`. Forgejo's branch protection still decides what
+  the push may change (protected file patterns, force pushes).
+- **Audit:** each push writes an attempt event before it is forwarded (no audit, no
+  push) and an outcome event after, also when the client disconnects early. A clone or
+  fetch is recorded at its `info/refs` request, and the first `git-upload-pack` POST per
+  credential each minute is recorded too, since a protocol v2 client can fetch without
+  `info/refs` (one event per window, not one per negotiation round). Events carry the person's subject, the repo, the branch's
+  digest and the old and new commit ids; never the credential.
+- **Limits:** `requests_per_minute` per person on the proxy, and one push at a time per
+  person and branch, however many credentials they hold.
+- **Commit authorship inside a push is whatever the client sets.** `git_access` returns
+  the signed-in person's name and email as `git_config`, the audit records who really
+  pushed, and the lane's proposer re-checks a branch before anything reaches GitHub; the
+  server does not rewrite or verify the author fields of pushed commits.
+- **The credential passes through the model's context** (the sandbox has nowhere else to
+  keep it). Its short life and narrow grant are the mitigation: it can only update that
+  person's own work branch, which Forgejo's protection limits further.
+
+Requires `auth_mode = "service_account"` and `branch_owners = true`.
 
 ## Security model
 
@@ -316,6 +374,7 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `branch_creation` | `api` | `api`, `webhook`, or a registered name; see *Branch creation*. |
 | `[tenants.branch_webhook]` | | `url`, `secret_file`/`secret_env`, `timeout_seconds` (60), `poll_interval_seconds` (2). |
 | `branch_owners` | `false` | Only a branch's creator may commit to it; see *Branch creation*. |
+| `[tenants.git_access]` | off | `enabled` (`false`), `public_url` (the server's own `https://host`, as git clients reach it), `ttl_seconds` (900; 60–3600), `max_push_bytes` (100 MiB), `requests_per_minute` (60, per person). See *Plain git*. |
 
 ## OAuth sign-in
 

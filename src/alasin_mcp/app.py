@@ -5,6 +5,9 @@ Routes:
 
 - ``/mcp``: the MCP endpoint (Streamable HTTP, stateless), bearer token required.
 - ``/healthz``: liveness, public.
+- ``/git/<owner>/<repo>.git/...``: git's smart HTTP for tenants with
+  ``git_access`` (gitproxy.py), authenticated by its own short-lived
+  credentials, not the bearer token.
 - ``/oauth/forgejo/callback``: the Forgejo OAuth redirect target for
   user-delegated tenants, public (it is protected by the single-use state).
 - With ``[auth.oauth]``: the front door's discovery and sign-in routes
@@ -46,6 +49,7 @@ from .credentials import (
     ServiceAccountProvider,
     UserDelegatedProvider,
 )
+from .gitproxy import GIT_PREFIX, GitProxy
 from .oauth import OAuthFrontDoor, front_door
 from .store import LocalKeyWrapper, Store
 from .tenancy import StaticTenantResolver, TenantResolver
@@ -100,6 +104,8 @@ def build_app(
         return HTMLResponse("Forgejo access is connected. You can close this tab.")
 
     app.router.routes.append(Route(CALLBACK_PATH, oauth_callback))
+    git = GitProxy(services)
+    app.router.routes.append(Route(GIT_PREFIX + "{rest:path}", git.handle, methods=["GET", "POST"]))
     public_paths: tuple[str, ...] = ("/healthz", CALLBACK_PATH)
     challenge = b'Bearer error="invalid_token"'
     if oauth is not None:
@@ -110,8 +116,10 @@ def build_app(
         BearerAuthMiddleware,
         verifier=verifier,
         public_paths=public_paths,
+        public_prefixes=(GIT_PREFIX,),
         max_body_bytes=max_request_bytes,
         challenge=challenge,
+        own_body_limit=(GIT_PREFIX,),
     )
     return app
 

@@ -196,8 +196,10 @@ class BearerAuthMiddleware:
         public_prefixes: tuple[str, ...] = (),
         max_body_bytes: int = 8 * 1024 * 1024,
         challenge: bytes = b'Bearer error="invalid_token"',
+        own_body_limit: tuple[str, ...] = (),
     ):
         self.app = app
+        self.own_body_limit = own_body_limit
         self.verifier = verifier
         self.public_paths = public_paths
         self.public_prefixes = public_prefixes
@@ -213,13 +215,16 @@ class BearerAuthMiddleware:
             if scope["type"] == "websocket":
                 await send({"type": "websocket.close", "code": 1008})
             return
-        length = _content_length(scope)
-        if length is not None and length > self.max_body_bytes:
-            await _error(send, 413, "request_too_large")
-            return
         # Never trust a principal that something upstream put in the scope.
         scope.pop(PRINCIPAL_SCOPE_KEY, None)
         path: str = scope.get("path", "")
+        length = _content_length(scope)
+        # Routes that authenticate and bound their own bodies (git pushes,
+        # gitproxy.py) skip this cap; everything else keeps it.
+        own_limit = bool(self.own_body_limit) and path.startswith(self.own_body_limit)
+        if length is not None and length > self.max_body_bytes and not own_limit:
+            await _error(send, 413, "request_too_large")
+            return
         if path in self.public_paths or path.startswith(self.public_prefixes):
             await self.app(scope, receive, send)
             return
