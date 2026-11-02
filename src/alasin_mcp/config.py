@@ -498,7 +498,9 @@ def _oauth_server(raw: dict[str, Any], server: ServerConfig) -> OAuthServerConfi
     for u in cimd:
         parsed = urlsplit(u)
         if parsed.scheme != "https" or not parsed.hostname or not parsed.path.strip("/"):
-            raise ConfigError(f"auth.oauth cimd_allowed_clients: {u!r} is not an exact https client_id URL")
+            raise ConfigError(
+                f"auth.oauth cimd_allowed_clients: {u!r} is not an exact https client_id URL"
+            )
     if cimd and public:
         raise ConfigError(
             "auth.oauth: cimd_allowed_clients and public_registration exclude each other; "
