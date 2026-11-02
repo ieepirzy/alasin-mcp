@@ -29,6 +29,7 @@ import binascii
 import difflib
 import fnmatch
 import hashlib
+import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -105,11 +106,13 @@ RESERVED_TRAILERS = ("trace-id", "alasin-session")
 # alone may be written out (the server adds it anyway).
 ATTRIBUTION_TRAILERS = ("co-authored-by", "signed-off-by")
 # Output caps, so that one tool result stays well under a client's limit
-# (claude.ai cuts a tool result at about 25k tokens; 60 KB of text is about
-# 15k). A result that is cut says truncated: true and how to continue.
-MAX_READ_BYTES = 60_000
+# (claude.ai cuts a tool result at about 25k tokens). Measured as JSON: what
+# goes on the wire, where a quote, a backslash or a tab takes two bytes and
+# another control character six. The SDK sends a structured result twice
+# (as text and as structuredContent), so each copy gets under half of ~60 KB.
+# A result that is cut says truncated: true and how to continue.
+RESULT_BUDGET = 28_000
 MAX_DIFF_FILES = 50
-MAX_DIFF_CHARS = 60_000
 MAX_DIFF_COMMITS = 100
 MAX_FOLDER_ENTRIES = 500
 _TRAILER_LINE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*: .+$")
@@ -481,6 +484,13 @@ _RESULT_KEEP = frozenset(
 )
 
 
+# Results that name a person (whoami, commit_files) leave these out entirely:
+# a digest of an email or a name is guessable, so not even that is written.
+_RESULT_PEOPLE = frozenset(
+    {"author", "committer", "name", "email", "subject", "idp_subject", "groups"}
+)
+
+
 def _result_summary(result: dict[str, Any], *, owner_named: bool = False) -> dict[str, Any]:
     """The result as recorded: ids, shas, counts and flags kept; lists as
     their length; author and committer left out; any other text (paths,
@@ -489,8 +499,8 @@ def _result_summary(result: dict[str, Any], *, owner_named: bool = False) -> dic
     repo itself (``owner_named``: the configuration names that owner)."""
     out: dict[str, Any] = {}
     for k, v in result.items():
-        if k in ("author", "committer"):
-            continue  # people; the commit records them
+        if k in _RESULT_PEOPLE:
+            continue  # people: the commit records authors, the event the sub
         if k == "url" and not owner_named and isinstance(v, str):
             out.update(digest(k, v))
             continue
@@ -706,9 +716,45 @@ def _text_or_none(data: bytes | None) -> list[str] | None:
     if b"\x00" in data:
         return None
     try:
-        return data.decode("utf-8").splitlines(keepends=True)
+        return _split_lines(data.decode("utf-8"))
     except UnicodeDecodeError:
         return None
+
+
+def _split_lines(text: str) -> list[str]:
+    """Lines as git, grep and editors count them: split on \n only, ends kept
+    (a CRLF line keeps its \r; str.splitlines would also split on \f, \v,
+    \x85, U+2028 and a lone \r)."""
+    parts = text.split("\n")
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+def _json_size(text: str) -> int:
+    """Bytes ``text`` takes inside a JSON string."""
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2
+
+
+def _char_json_size(ch: str) -> int:
+    if ch in '"\\\n\r\t\b\f':
+        return 2
+    if ord(ch) < 0x20:
+        return 6
+    return len(ch.encode("utf-8"))
+
+
+def _fit(text: str, budget: int) -> int:
+    """How many characters of ``text`` fit in ``budget`` JSON bytes."""
+    if _json_size(text) <= budget:
+        return len(text)
+    used = 0
+    for i, ch in enumerate(text):
+        used += _char_json_size(ch)
+        if used > budget:
+            return i
+    return len(text)
 
 
 def _decode_text(data: bytes, cut: bool) -> str | None:
@@ -728,44 +774,52 @@ def _decode_text(data: bytes, cut: bool) -> str | None:
         return None
 
 
-def _line_window(text: str, start_line: int, max_lines: int, cut: bool) -> dict[str, Any]:
-    """Lines ``start_line``.. of ``text``, as many as fit in MAX_READ_BYTES
-    (and at most ``max_lines`` when set), with what a caller needs to go on."""
-    lines = text.splitlines(keepends=True)
+def _line_window(
+    text: str, start_line: int, offset: int, max_lines: int, cut: bool
+) -> dict[str, Any]:
+    """Lines from ``start_line`` (from character ``offset`` in it), as many as
+    fit in RESULT_BUDGET (and at most ``max_lines`` when set). A line too long
+    for one result comes back in pieces: ``next_offset`` says where it goes on,
+    so every file the server reads can be put back together exactly."""
+    lines = _split_lines(text)
     total = len(lines)
-    if total and start_line > total:
+    if start_line > max(total, 1):
         raise InvalidInput(f"start_line {start_line} is past the end ({total} lines)")
-    first = start_line - 1
-    budget = MAX_READ_BYTES
+    if offset and (not total or offset >= len(lines[start_line - 1])):
+        raise InvalidInput(f"offset {offset} is past the end of line {start_line}")
+    budget = RESULT_BUDGET
     taken: list[str] = []
-    note = None
-    for line in lines[first:]:
-        if max_lines and len(taken) >= max_lines:
-            break
-        size = len(line.encode("utf-8"))
-        if size > budget:
-            if not taken:
-                # One line longer than the cap (minified code): its start only.
-                part = line.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
-                taken.append(part)
-                note = f"line {start_line} is longer than {MAX_READ_BYTES} bytes; only its start is shown"
-            break
-        taken.append(line)
-        budget -= size
-    end = first + len(taken)
-    more = end < total
+    i, pos = start_line - 1, offset
+    next_line = next_offset = None
+    while i < total and not (max_lines and len(taken) >= max_lines):
+        rest = lines[i][pos:]
+        size = _json_size(rest)
+        if size <= budget:
+            taken.append(rest)
+            budget -= size
+            i, pos = i + 1, 0
+            continue
+        if not taken:
+            # Longer than one result (minified code): this piece, then more.
+            n = max(_fit(rest, budget), 1)
+            taken.append(rest[:n])
+            next_line, next_offset = i + 1, pos + n
+        break
+    if next_line is None and i < total:
+        next_line = i + 1
+    end_line = next_line if next_offset is not None else i
     window: dict[str, Any] = {
         "content": "".join(taken),
         "start_line": start_line,
-        "end_line": end,
+        "offset": offset,
+        "end_line": end_line,
         "total_lines": total,
-        # More lines, a cut line, or a file longer than the tenant's read limit.
-        "truncated": more or note is not None or cut,
-        "next_start_line": end + 1 if more else None,
+        # More to read, or a file longer than the tenant's read limit.
+        "truncated": next_line is not None or cut,
+        "next_start_line": next_line,
+        "next_offset": next_offset,
     }
-    if note:
-        window["note"] = note
-    elif cut and not more:
+    if cut and next_line is None:
         window["note"] = "the file is longer than this server reads; the rest is not available"
     return window
 
@@ -927,19 +981,24 @@ def build_server(services: Services) -> MCPServer:
                 listing = await client.contents(r, p, rf)
             if not isinstance(listing, list):
                 raise InvalidInput(f"'{p}' is a file; use read_file")
+            entries: list[dict[str, Any]] = []
+            budget = RESULT_BUDGET
+            for e in listing[:MAX_FOLDER_ENTRIES]:
+                entry = {
+                    "name": e.get("name"),
+                    "path": e.get("path"),
+                    "type": e.get("type"),
+                    "size": e.get("size"),
+                }
+                budget -= _json_size(json.dumps(entry, ensure_ascii=False))
+                if budget < 0:
+                    break
+                entries.append(entry)
             return {
                 "path": p,
-                "entries": [
-                    {
-                        "name": e.get("name"),
-                        "path": e.get("path"),
-                        "type": e.get("type"),
-                        "size": e.get("size"),
-                    }
-                    for e in listing[:MAX_FOLDER_ENTRIES]
-                ],
+                "entries": entries,
                 "total_entries": len(listing),
-                "truncated": len(listing) > MAX_FOLDER_ENTRIES,
+                "truncated": len(entries) < len(listing),
             }
 
         args = {"repo": repo, "path": path, "ref": ref}
@@ -947,9 +1006,9 @@ def build_server(services: Services) -> MCPServer:
 
     @server.tool(
         description="Read a file. ref defaults to the default branch. Text comes back as "
-        f"utf-8, anything else as base64. At most {MAX_READ_BYTES // 1000} KB per call: a "
-        "longer text file comes back in line ranges, with truncated: true and "
-        "next_start_line to pass as start_line for the rest.",
+        f"utf-8, anything else as base64. About {RESULT_BUDGET // 1000} KB per call: a longer "
+        "file comes back in parts with truncated: true; pass next_start_line and "
+        "next_offset back as start_line and offset for the next part.",
         annotations=READ_ONLY,
         structured_output=True,
     )
@@ -960,6 +1019,14 @@ def build_server(services: Services) -> MCPServer:
         path: str,
         ref: str = "",
         start_line: Annotated[int, Field(ge=1, description="First line to return (1-based).")] = 1,
+        offset: Annotated[
+            int,
+            Field(
+                ge=0,
+                description="Where to start in start_line, in characters (for base64 "
+                "content: in bytes of the file). Use next_offset from the last part.",
+            ),
+        ] = 0,
         max_lines: Annotated[
             int, Field(ge=0, description="Most lines to return; 0 means as many as fit.")
         ] = 0,
@@ -994,21 +1061,29 @@ def build_server(services: Services) -> MCPServer:
             text = _decode_text(data, cut)
             out: dict[str, Any] = {"path": p, "sha": meta.get("sha"), "size": meta.get("size")}
             if text is None:
-                # base64 grows 4/3: keep the encoded form within the cap.
-                raw_cap = min(limit, MAX_READ_BYTES * 3 // 4)
+                # base64 grows 4/3; a multiple of 3 bytes per part keeps each
+                # part's base64 whole, so the parts decode one by one.
+                if offset and offset >= len(data):
+                    raise InvalidInput(f"offset {offset} is past the end ({len(data)} bytes)")
+                part = data[offset : offset + RESULT_BUDGET * 3 // 4 // 3 * 3]
+                more = offset + len(part) < len(data)
                 return {
                     **out,
                     "encoding": "base64",
-                    "truncated": cut or len(data) > raw_cap,
-                    "content": base64.b64encode(data[:raw_cap]).decode(),
+                    "offset": offset,
+                    "truncated": more or cut,
+                    "next_offset": offset + len(part) if more else None,
+                    "content": base64.b64encode(part).decode(),
                 }
-            return {**out, "encoding": "utf-8", **_line_window(text, start_line, max_lines, cut)}
+            window = _line_window(text, start_line, offset, max_lines, cut)
+            return {**out, "encoding": "utf-8", **window}
 
         args = {
             "repo": repo,
             "path": path,
             "ref": ref,
             "start_line": start_line,
+            "offset": offset,
             "max_lines": max_lines,
         }
         return await services.call(ctx, "read_file", args, session_id, body)
@@ -1038,9 +1113,24 @@ def build_server(services: Services) -> MCPServer:
                     for parent in c.get("parents") or []:
                         if parent.get("sha") not in shas:
                             merge_base = parent["sha"]
+                # Commit messages may take a quarter of the budget, diffs the rest.
+                budget = RESULT_BUDGET // 4
+                truncated = len(commits) > MAX_DIFF_COMMITS
+                listed: list[dict[str, Any]] = []
+                for c in commits[:MAX_DIFF_COMMITS]:
+                    message = ((c.get("commit") or {}).get("message") or "")[:2000]
+                    budget -= 60  # the sha and the keys
+                    n = _fit(message, max(budget, 0))
+                    if budget <= 0 or (n < len(message) and n == 0):
+                        truncated = True
+                        break
+                    truncated = truncated or n < len(message)
+                    listed.append({"sha": c["sha"], "message": message[:n]})
+                    budget -= _json_size(message[:n])
+                budget += RESULT_BUDGET - RESULT_BUDGET // 4
                 diffs: list[dict[str, Any]] = []
-                budget = MAX_DIFF_CHARS
                 files = cmp.get("files") or []
+                truncated = truncated or len(files) > MAX_DIFF_FILES
                 for f in files[:MAX_DIFF_FILES]:
                     raw_name = f.get("filename")
                     try:
@@ -1048,19 +1138,18 @@ def build_server(services: Services) -> MCPServer:
                         # made with this tenant's token: validate like any input.
                         name = validation.file_path(str(raw_name))
                     except InvalidInput:
-                        diffs.append(
-                            {
-                                "path": str(raw_name)[:200],
-                                "status": f.get("status"),
-                                "diff": None,
-                                "note": "skipped: path not accepted by the server",
-                            }
-                        )
-                        continue
-                    entry: dict[str, Any] = {"path": name, "status": f.get("status")}
+                        name = None
+                    shown = name or str(raw_name)[:200]
+                    # The entry's keys, path, status and a note.
+                    budget -= 120 + _json_size(shown)
                     if budget <= 0:
+                        # Out of room: the rest of the files are left out.
+                        truncated = True
+                        break
+                    entry: dict[str, Any] = {"path": shown, "status": f.get("status")}
+                    if name is None:
                         entry["diff"] = None
-                        entry["note"] = "diff omitted: output limit reached"
+                        entry["note"] = "skipped: path not accepted by the server"
                         diffs.append(entry)
                         continue
                     old = _text_or_none(await client.raw(r, name, merge_base))
@@ -1070,29 +1159,22 @@ def build_server(services: Services) -> MCPServer:
                         entry["note"] = "binary file"
                     else:
                         text = "".join(difflib.unified_diff(old, new, f"a/{name}", f"b/{name}"))
-                        entry["diff"] = text[:budget]
-                        if len(text) > budget:
+                        n = _fit(text, budget)
+                        entry["diff"] = text[:n]
+                        if n < len(text):
                             entry["note"] = "diff truncated"
-                        budget -= len(text)
+                            truncated = True
+                        budget -= _json_size(text[:n])
                     diffs.append(entry)
             return {
                 "base": base_ref,
                 "merge_base": merge_base,
                 "branch": head,
-                "commits": [
-                    {
-                        "sha": c["sha"],
-                        "message": ((c.get("commit") or {}).get("message") or "")[:2000],
-                    }
-                    for c in commits[:MAX_DIFF_COMMITS]
-                ],
+                "commits": listed,
                 "commit_count": len(commits),
                 "files_changed": len(files),
                 "files": diffs,
-                "truncated": budget < 0
-                or any(d.get("note", "").startswith("diff omitted") for d in diffs)
-                or len(files) > MAX_DIFF_FILES
-                or len(commits) > MAX_DIFF_COMMITS,
+                "truncated": truncated,
             }
 
         args = {"repo": repo, "branch": branch, "base": base}

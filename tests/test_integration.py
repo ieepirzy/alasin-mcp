@@ -271,11 +271,11 @@ async def test_author_argument_needs_opt_in(forgejo, monkeypatch) -> None:
 
 async def test_read_file_returns_large_files_in_line_windows(forgejo, monkeypatch) -> None:
     """A file over the cap comes back in windows that reassemble it exactly;
-    each result stays under MAX_READ_BYTES (claude.ai cuts at ~25k tokens)."""
-    from alasin_mcp.tools import MAX_READ_BYTES
+    each result stays under RESULT_BUDGET (claude.ai cuts at ~25k tokens)."""
+    from alasin_mcp.tools import RESULT_BUDGET
 
     big = "".join(f"const line{i} = 'täällä {i}';\n" for i in range(5000))
-    assert len(big.encode()) > 2 * MAX_READ_BYTES
+    assert len(big.encode()) > 2 * RESULT_BUDGET
     with server(forgejo, monkeypatch) as (url, _, _):
         sid = (await ok(url, "begin_change", {}))["session_id"]
         base = {"session_id": sid, "repo": "acme/site"}
@@ -298,7 +298,7 @@ async def test_read_file_returns_large_files_in_line_windows(forgejo, monkeypatc
                 {**base, "path": "big.js", "ref": "lane/big", "start_line": start},
             )
             calls += 1
-            assert len(f["content"].encode()) <= MAX_READ_BYTES
+            assert len(f["content"].encode()) <= RESULT_BUDGET
             assert f["total_lines"] == 5000 and f["start_line"] == start
             assert f["truncated"] is (f["next_start_line"] is not None)
             got += f["content"]
