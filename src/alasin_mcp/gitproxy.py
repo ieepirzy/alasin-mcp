@@ -246,22 +246,21 @@ class GitProxy:
         # (protocol v2 fetches skip info/refs; see _fetch_audit_due).
         self._fetch_audited: dict[str, float] = {}
 
-    def _failure_budget_left(self, ip: str, now: float) -> bool:
-        tokens, last = self._failures.get(ip, (float(AUTH_FAILURES_PER_MINUTE), now))
-        tokens = min(
-            float(AUTH_FAILURES_PER_MINUTE), tokens + (now - last) * AUTH_FAILURES_PER_MINUTE / 60
-        )
+    def _failed(self, ip: str, now: float) -> bool:
+        """Count a failed credential check from ``ip``; return whether the
+        address is now over its budget (answer 429 rather than 401). Only
+        failures count and only failures are throttled: a valid credential
+        from the same (shared) address always gets through."""
+        rate = float(AUTH_FAILURES_PER_MINUTE)
         with self._lock:
-            self._failures[ip] = (tokens, now)
-        return tokens >= 1.0
-
-    def _record_failure(self, ip: str, now: float) -> None:
-        with self._lock:
-            tokens, _ = self._failures.get(ip, (float(AUTH_FAILURES_PER_MINUTE), now))
+            tokens, last = self._failures.get(ip, (rate, now))
+            tokens = min(rate, tokens + (now - last) * rate / 60)
+            over = tokens < 1.0
             self._failures[ip] = (max(tokens - 1.0, 0.0), now)
             if len(self._failures) > 10_000:  # bound memory: drop the oldest half
                 for k in sorted(self._failures, key=lambda k: self._failures[k][1])[:5_000]:
                     del self._failures[k]
+        return over
 
     def _fetch_audit_due(self, token_sha: str, now: float) -> bool:
         """Whether this git-upload-pack POST gets its own audit event: the first
@@ -298,15 +297,15 @@ class GitProxy:
             repo = validation.repo(f"{m.group('owner')}/{m.group('name')}")
         except validation.InvalidInput:
             return PlainTextResponse("not found\n", status_code=404)
-        ip = self.services.client_ip.client_ip(request) or "unknown"
         now = time.monotonic()
-        if not self._failure_budget_left(ip, now):
-            return PlainTextResponse("too many failed attempts; wait a minute\n", 429)
         token = credential(request)
+        # Always looked up (a SHA-256 and a primary-key read): a valid
+        # credential is never held back by others' failures at a shared address.
         grant = self.services.store.get_git_token(token) if token else None
         if grant is None:
-            if token:
-                self._record_failure(ip, now)
+            ip = self.services.client_ip.client_ip(request) or "unknown"
+            if token and self._failed(ip, now):
+                return PlainTextResponse("too many failed attempts; wait a minute\n", 429)
             return _unauthorized(
                 "authentication required: ask Claude for git access again (it expires)"
                 if token

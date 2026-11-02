@@ -340,6 +340,11 @@ async def test_query_and_fetch_audit_and_failures(
             for _ in range(35)
         ]
         assert codes[0] == 401 and codes[-1] == 429
+        # The same address, over its failure budget: a valid credential still works.
+        r = httpx.get(f"{base}/info/refs?service=git-upload-pack", auth=auth, timeout=10)
+        assert r.status_code == 200, r.text
+        bad = httpx.get(f"{base}/info/refs?service=git-upload-pack", auth=("x", "no"), timeout=10)
+        assert bad.status_code == 429
 
 
 async def test_push_rechecks_the_branch_owner(
