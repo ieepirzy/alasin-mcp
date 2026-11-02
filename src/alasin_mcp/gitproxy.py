@@ -30,10 +30,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import logging
 import re
 import threading
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -72,6 +74,10 @@ MAX_PKT = 65520
 _FORWARD_REQUEST = ("content-type", "content-encoding", "accept", "git-protocol", "user-agent")
 _FORWARD_RESPONSE = ("content-type", "cache-control", "expires", "pragma")
 _TIMEOUT = httpx.Timeout(300.0, connect=10.0, pool=10.0)
+# Failed credential checks one client address may make per minute.
+AUTH_FAILURES_PER_MINUTE = 30
+# At most one audited git-upload-pack POST per credential in this many seconds.
+FETCH_AUDIT_WINDOW = 60.0
 
 
 class ProtocolError(ValueError):
@@ -146,11 +152,33 @@ def parse_push_head(buf: bytes) -> PushHead | None:
         commands.append(RefCommand(old, new, ref))
 
 
+# Capabilities a push may ask for, by name (the part before any '='). git
+# matches "name=value" as well as "name", so anything else, push-options in
+# particular (Forgejo applies options such as repo.private on post-receive,
+# as the service account), is refused rather than filtered.
+ALLOWED_CAPABILITIES = frozenset(
+    {
+        "report-status",
+        "report-status-v2",
+        "side-band-64k",
+        "side-band",
+        "quiet",
+        "atomic",
+        "ofs-delta",
+        "agent",
+        "object-format",
+        "session-id",
+    }
+)
+
+
 def refusal(head: PushHead, branch: str) -> str | None:
     """Why this push may not go through, or None."""
     want = f"refs/heads/{branch}"
-    if "push-options" in head.capabilities:
-        return "push options are not supported"
+    for cap in head.capabilities:
+        name = cap.partition("=")[0]
+        if name not in ALLOWED_CAPABILITIES:
+            return f"the '{name[:40]}' capability is not supported (push options included)"
     for c in head.commands:
         if c.ref != want:
             return f"only {want} may be pushed with this access"
@@ -206,9 +234,49 @@ class GitProxy:
 
     def __init__(self, services: Services):
         self.services = services
-        # One push at a time per credential.
-        self._pushing: set[str] = set()
+        # One push at a time per (tenant, person, repo, branch): minting more
+        # credentials for the same branch doesn't get around it.
+        self._pushing: set[tuple[str, str, str, str]] = set()
         self._lock = threading.Lock()
+        # Failed credential checks per client address, so guessing costs
+        # something before the hash and the database lookup. Successful
+        # requests don't count: claude.ai sandboxes share egress addresses.
+        self._failures: dict[str, tuple[float, float]] = {}
+        # When each credential last had a git-upload-pack POST audited
+        # (protocol v2 fetches skip info/refs; see _fetch_audit_due).
+        self._fetch_audited: dict[str, float] = {}
+
+    def _failure_budget_left(self, ip: str, now: float) -> bool:
+        tokens, last = self._failures.get(ip, (float(AUTH_FAILURES_PER_MINUTE), now))
+        tokens = min(
+            float(AUTH_FAILURES_PER_MINUTE), tokens + (now - last) * AUTH_FAILURES_PER_MINUTE / 60
+        )
+        with self._lock:
+            self._failures[ip] = (tokens, now)
+        return tokens >= 1.0
+
+    def _record_failure(self, ip: str, now: float) -> None:
+        with self._lock:
+            tokens, _ = self._failures.get(ip, (float(AUTH_FAILURES_PER_MINUTE), now))
+            self._failures[ip] = (max(tokens - 1.0, 0.0), now)
+            if len(self._failures) > 10_000:  # bound memory: drop the oldest half
+                for k in sorted(self._failures, key=lambda k: self._failures[k][1])[:5_000]:
+                    del self._failures[k]
+
+    def _fetch_audit_due(self, token_sha: str, now: float) -> bool:
+        """Whether this git-upload-pack POST gets its own audit event: the first
+        per credential in each FETCH_AUDIT_WINDOW. A protocol v2 client can fetch
+        with POSTs alone (ls-refs, fetch), never calling info/refs; one event per
+        window records every such fetch without one event per negotiation round."""
+        with self._lock:
+            last = self._fetch_audited.get(token_sha)
+            if last is not None and now - last < FETCH_AUDIT_WINDOW:
+                return False
+            self._fetch_audited[token_sha] = now
+            if len(self._fetch_audited) > 10_000:
+                cutoff = now - FETCH_AUDIT_WINDOW
+                self._fetch_audited = {k: v for k, v in self._fetch_audited.items() if v > cutoff}
+            return True
 
     async def handle(self, request: Request) -> Response:
         m = _ROUTE.match(request.url.path)
@@ -216,9 +284,12 @@ class GitProxy:
             return PlainTextResponse("not found\n", status_code=404)
         rest = m.group("rest")
         if rest == "info/refs":
-            service = request.query_params.get("service", "")
-            if request.method != "GET" or service not in _SERVICES:
+            # Exactly one service, read the same way here as the upstream will:
+            # Starlette and Go disagree on which of two repeated values counts.
+            services = request.query_params.getlist("service")
+            if request.method != "GET" or len(services) != 1 or services[0] not in _SERVICES:
                 return PlainTextResponse("only git's smart HTTP is served\n", status_code=403)
+            service = services[0]
         elif request.method != "POST":
             return PlainTextResponse("method not allowed\n", status_code=405)
         else:
@@ -227,9 +298,15 @@ class GitProxy:
             repo = validation.repo(f"{m.group('owner')}/{m.group('name')}")
         except validation.InvalidInput:
             return PlainTextResponse("not found\n", status_code=404)
+        ip = self.services.client_ip.client_ip(request) or "unknown"
+        now = time.monotonic()
+        if not self._failure_budget_left(ip, now):
+            return PlainTextResponse("too many failed attempts; wait a minute\n", 429)
         token = credential(request)
         grant = self.services.store.get_git_token(token) if token else None
         if grant is None:
+            if token:
+                self._record_failure(ip, now)
             return _unauthorized(
                 "authentication required: ask Claude for git access again (it expires)"
                 if token
@@ -254,31 +331,72 @@ class GitProxy:
             )
         except RateLimited as e:
             return PlainTextResponse(f"{e}\n", status_code=429)
+        # Never the client's query string: only the validated service.
         upstream = f"{tenant.forgejo_url}/{grant.repo}.git/{rest}"
-        if request.url.query:
-            upstream += "?" + request.url.query
+        if rest == "info/refs":
+            upstream += f"?service={service}"
         ctx = _Context(self.services, tenant, grant, request, upstream, cfg.max_push_bytes)
         if rest == "info/refs":
             if service == "git-upload-pack":
                 return await ctx.forward_audited("git_fetch", request.stream())
             return await ctx.forward(request.stream())
         if service == "git-upload-pack":
+            assert token is not None
+            if self._fetch_audit_due(hashlib.sha256(token.encode()).hexdigest(), now):
+                return await ctx.forward_audited("git_fetch", request.stream())
             return await ctx.forward(request.stream())
-        assert token is not None
-        key = token
+        # The branch must still be this person's: ownership can move (a
+        # restored state, a re-registered branch) after the credential was made.
+        owner = self.services.store.branch_owner(tenant.id, grant.repo, grant.branch)
+        if owner != grant.subject:
+            return PlainTextResponse("this branch is no longer yours to push\n", 403)
+        key = (tenant.id, grant.subject, grant.repo.casefold(), grant.branch)
         with self._lock:
             if key in self._pushing:
-                return PlainTextResponse("a push with this access is already running\n", 429)
+                return PlainTextResponse("a push to this branch is already running\n", 429)
             self._pushing.add(key)
-        try:
-            return await ctx.push()
-        finally:
+
+        def release() -> None:
             with self._lock:
                 self._pushing.discard(key)
+
+        try:
+            response = await ctx.push(release)
+        except BaseException:
+            release()
+            raise
+        return response
 
 
 class _BodyTooLarge(Exception):
     pass
+
+
+class _Finishing(StreamingResponse):
+    """A streamed response whose ``finish`` always runs, even when the client
+    disconnected before the body was iterated (Starlette never starts the
+    iterator then, so a ``finally`` inside it would not run)."""
+
+    def __init__(
+        self,
+        content: AsyncIterator[bytes],
+        finish: Callable[[], Awaitable[None]],
+        **kw: Any,
+    ):
+        super().__init__(content, **kw)
+        self._finish = finish
+        self._finished = False
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self.finish()
+
+    async def finish(self) -> None:
+        if not self._finished:
+            self._finished = True
+            await self._finish()
 
 
 class _Context:
@@ -346,20 +464,25 @@ class _Context:
             log.warning("git upstream unreachable: %s", type(e).__name__)
             return PlainTextResponse("Forgejo is unreachable\n", status_code=502)
         headers = {k: v for k in _FORWARD_RESPONSE if (v := resp.headers.get(k)) is not None}
+        state = {"ok": False}
 
         async def stream() -> AsyncIterator[bytes]:
-            ok = False
-            try:
-                async for chunk in resp.aiter_raw():
-                    yield chunk
-                ok = True
-            finally:
-                await resp.aclose()
-                await http.aclose()
-                if on_done is not None:
-                    await on_done(resp.status_code if ok else 502)
+            async for chunk in resp.aiter_raw():
+                yield chunk
+            state["ok"] = True
 
-        return StreamingResponse(stream(), status_code=resp.status_code, headers=headers)
+        async def finish() -> None:
+            # Runs once, however the response ends: streamed in full, cut
+            # off, or never started because the client had already gone.
+            with anyio.CancelScope(shield=True):
+                try:
+                    await resp.aclose()
+                    await http.aclose()
+                finally:
+                    if on_done is not None:
+                        await on_done(resp.status_code if state["ok"] else 499)
+
+        return _Finishing(stream(), finish, status_code=resp.status_code, headers=headers)
 
     async def forward_audited(self, action: str, body: AsyncIterator[bytes]) -> Response:
         async def done(status: int) -> None:
@@ -372,7 +495,20 @@ class _Context:
 
         return await self.forward(body, done)
 
-    async def push(self) -> Response:
+    async def push(self, release: Callable[[], None]) -> Response:
+        """Check and forward one push. ``release`` frees the branch's push slot;
+        it is called exactly once, when the push is over (answered, refused,
+        or the client went away)."""
+        try:
+            response = await self._push(release)
+        except BaseException:
+            release()
+            raise
+        if not isinstance(response, _Finishing):
+            release()
+        return response
+
+    async def _push(self, release: Callable[[], None]) -> Response:
         length = self.request.headers.get("content-length")
         if length is not None and length.isdigit() and int(length) > self.max_bytes:
             return PlainTextResponse("the push is too large\n", status_code=413)
@@ -434,11 +570,14 @@ class _Context:
 
         async def done(status: int) -> None:
             outcome = "ok" if 200 <= status < 300 else "error"
-            await self._emit(
-                {**self.event, "phase": "outcome", "action": "git_push", "refs": refs,
-                 "status": status, "outcome": outcome},
-                required=False,
-            )  # fmt: skip
+            try:
+                await self._emit(
+                    {**self.event, "phase": "outcome", "action": "git_push", "refs": refs,
+                     "status": status, "outcome": outcome},
+                    required=False,
+                )  # fmt: skip
+            finally:
+                release()
 
         return await self.forward(body(), done)
 

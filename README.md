@@ -70,28 +70,39 @@ git push origin lane/change-1a2b3c4d
 
 - **The credential** is random (32 bytes), stored only as its SHA-256, and valid for
   `ttl_seconds` (15 minutes by default) for one person, one repository and one branch.
+  It **reads the whole repository** (every branch, as clone and fetch do) by design, and
+  **pushes only that branch**.
   It sits in the URL's user part, so git sends it as HTTP Basic auth and it never appears
   in a request path or an access log. When it expires, call `git_access` again and
   `git remote set-url origin <new clone_url>`.
 - **Routes:** only git's smart HTTP under `/git/<owner>/<repo>.git/`: `info/refs`
-  (`git-upload-pack` or `git-receive-pack`), `git-upload-pack` and `git-receive-pack`.
-  No dumb HTTP, no LFS. A missing or expired credential gets `401` with a Basic
-  challenge.
+  (exactly one `service`, `git-upload-pack` or `git-receive-pack`), `git-upload-pack`
+  and `git-receive-pack`. No dumb HTTP, no LFS. The client's query string is never
+  forwarded; the server builds `?service=` itself. A missing or expired credential gets
+  `401` with a Basic challenge; one client address may fail 30 times a minute before it
+  gets `429` (successes don't count: sandboxes share addresses).
 - **Forwarding:** to the tenant's Forgejo with the tenant's service token (re-read on
   every request); the caller's credential never leaves the server. Request and response
   bodies are streamed; a push is capped at `max_push_bytes`.
 - **Pushes are checked before anything reaches Forgejo.** Every ref command must update
   exactly `refs/heads/<the credential's branch>`: no other branch, no tag, no new
-  branch, no deletion, no push options, no shallow or signed pushes. A refused push is
+  branch, no deletion, no shallow or signed pushes. Capabilities are an allowlist
+  (`report-status`, `report-status-v2`, `side-band-64k`, `side-band`, `quiet`, `atomic`,
+  `ofs-delta`, `agent`, `object-format`, `session-id`, by name before any `=`): push
+  options in particular are refused, because Forgejo applies options such as
+  `repo.private` as the pusher, the service account. The branch's owner is checked again
+  at every push. A refused push is
   answered in git's report-status format, so git prints
   `! [remote rejected] ... (<reason>)`. Forgejo's branch protection still decides what
   the push may change (protected file patterns, force pushes).
 - **Audit:** each push writes an attempt event before it is forwarded (no audit, no
-  push) and an outcome event after; a clone or fetch is recorded once, at its
-  `info/refs` request. Events carry the person's subject, the repo, the branch's
+  push) and an outcome event after, also when the client disconnects early. A clone or
+  fetch is recorded at its `info/refs` request, and the first `git-upload-pack` POST per
+  credential each minute is recorded too, since a protocol v2 client can fetch without
+  `info/refs` (one event per window, not one per negotiation round). Events carry the person's subject, the repo, the branch's
   digest and the old and new commit ids; never the credential.
 - **Limits:** `requests_per_minute` per person on the proxy, and one push at a time per
-  credential.
+  person and branch, however many credentials they hold.
 - **Commit authorship inside a push is whatever the client sets.** `git_access` returns
   the signed-in person's name and email as `git_config`, the audit records who really
   pushed, and the lane's proposer re-checks a branch before anything reaches GitHub; the

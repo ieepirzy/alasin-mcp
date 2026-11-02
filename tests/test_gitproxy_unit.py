@@ -7,7 +7,7 @@ from __future__ import annotations
 import base64
 
 import pytest
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 
 from alasin_mcp.gitproxy import (
     MAX_COMMAND_BYTES,
@@ -141,3 +141,44 @@ def test_credential_is_the_basic_password() -> None:
     assert credential(_request("Basic !!!")) is None
     assert credential(_request("Basic " + base64.b64encode(b"nopassword").decode())) is None
     assert credential(_request("Basic " + base64.b64encode(b"user:").decode())) is None
+
+
+def test_capabilities_are_an_allowlist() -> None:
+    def caps(c: bytes):  # noqa: ANN202
+        h = parse_push_head(cmd(A, B, "refs/heads/lane/x", c) + b"0000")
+        assert h is not None
+        return h
+
+    real = b"report-status-v2 side-band-64k quiet object-format=sha1 agent=git/2.56.0"
+    assert refusal(caps(real), "lane/x") is None
+    assert refusal(caps(b"report-status atomic ofs-delta session-id=abc"), "lane/x") is None
+    # git enables a feature for "name=value" too: push-options=1 must not slip by.
+    assert refusal(caps(b"report-status push-options"), "lane/x")
+    assert refusal(caps(b"report-status push-options=1"), "lane/x")
+    assert refusal(caps(b"report-status some-future-thing"), "lane/x")
+
+
+@pytest.mark.anyio
+async def test_finishing_response_finishes_when_never_iterated() -> None:
+    from alasin_mcp.gitproxy import _Finishing
+
+    finished: list[bool] = []
+
+    async def body():  # noqa: ANN202
+        yield b"never"
+
+    async def finish() -> None:
+        finished.append(True)
+
+    async def send(_message: object) -> None:
+        raise OSError("client went away")
+
+    async def receive() -> dict[str, str]:
+        return {"type": "http.disconnect"}
+
+    r = _Finishing(body(), finish, status_code=200)
+    with pytest.raises((OSError, ClientDisconnect)):
+        await r({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+    assert finished == [True]
+    await r.finish()  # idempotent
+    assert finished == [True]

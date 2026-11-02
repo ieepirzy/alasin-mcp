@@ -264,3 +264,96 @@ async def test_force_push_is_left_to_forgejo(
         forced = git(work, "push", "--force", "origin", branch, check=False)
         assert forced.returncode != 0, forced.stderr
         assert branch_head(forgejo, branch) == pushed
+
+
+def _no_cred(clone_url: str) -> str:
+    """The clone URL without its credential, and the credential."""
+    scheme, rest = clone_url.split("://", 1)
+    cred, host = rest.split("@", 1)
+    return f"{scheme}://{host}", cred.split(":", 1)[1]
+
+
+async def test_push_options_are_refused(
+    forgejo: fj.Forgejo, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Forgejo applies push options such as repo.private as the pusher, which
+    here is the service account: alasin refuses any push that carries them."""
+    with server(forgejo, monkeypatch) as (url, _, _):
+        sid = (await ok(url, "begin_change", {}))["session_id"]
+        access = await ok(url, "git_access", {"session_id": sid, "repo": "acme/site"})
+        branch = access["branch"]
+        work = clone(tmp_path, access)
+        (work / "index.html").write_text("<h1>opts</h1>\n")
+        git(work, "commit", "-am", "opts")
+        before = branch_head(forgejo, branch)
+        pushed = git(work, "push", "-o", "repo.private=true", "origin", branch, check=False)
+        assert pushed.returncode != 0, pushed.stderr
+        assert "push-options" in pushed.stderr or "capability" in pushed.stderr
+        assert branch_head(forgejo, branch) == before
+        repo = httpx.get(
+            f"{forgejo.url}/api/v1/repos/acme/site",
+            headers={"Authorization": f"token {forgejo.admin_token}"},
+            timeout=10,
+        ).json()
+        assert repo["private"] is False
+
+
+async def test_query_and_fetch_audit_and_failures(
+    forgejo: fj.Forgejo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with server(forgejo, monkeypatch) as (url, audit, store):
+        sid = (await ok(url, "begin_change", {}))["session_id"]
+        access = await ok(url, "git_access", {"session_id": sid, "repo": "acme/site"})
+        base, cred = _no_cred(access["clone_url"])
+        auth = ("x-token", cred)
+        # A repeated service is refused, whichever value comes last.
+        r = httpx.get(
+            f"{base}/info/refs?service=git-upload-pack&service=git-receive-pack",
+            auth=auth,
+            timeout=10,
+        )
+        assert r.status_code == 403
+        # Protocol v2 fetches with POSTs alone, never info/refs: still audited.
+        before = sum(1 for e in audit.events if e.get("action") == "git_fetch")
+        body = b"0014command=ls-refs\n0001" + b"0000"
+        r = httpx.post(
+            f"{base}/git-upload-pack",
+            auth=auth,
+            content=body,
+            headers={
+                "content-type": "application/x-git-upload-pack-request",
+                "git-protocol": "version=2",
+            },
+            timeout=10,
+        )
+        assert r.status_code == 200, r.text
+        # The outcome is written once the response has been sent: allow a moment.
+        deadline = time.monotonic() + 5
+        while sum(1 for e in audit.events if e.get("action") == "git_fetch") == before:
+            assert time.monotonic() < deadline, "no git_fetch audit event"
+            time.sleep(0.05)
+        # Failed credentials from one address run out; good ones don't count.
+        codes = [
+            httpx.get(
+                f"{base}/info/refs?service=git-upload-pack", auth=("x", "wrong"), timeout=10
+            ).status_code
+            for _ in range(35)
+        ]
+        assert codes[0] == 401 and codes[-1] == 429
+
+
+async def test_push_rechecks_the_branch_owner(
+    forgejo: fj.Forgejo, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with server(forgejo, monkeypatch) as (url, _, store):
+        sid = (await ok(url, "begin_change", {}))["session_id"]
+        access = await ok(url, "git_access", {"session_id": sid, "repo": "acme/site"})
+        branch = access["branch"]
+        work = clone(tmp_path, access)
+        (work / "index.html").write_text("<h1>owner</h1>\n")
+        git(work, "commit", "-am", "owner")
+        # The branch changes hands after the credential was made.
+        store.confirm_branch("a", "acme/site", branch, "bob")
+        pushed = git(work, "push", "origin", branch, check=False)
+        assert pushed.returncode != 0
+        assert "no longer yours" in pushed.stderr or "403" in pushed.stderr
