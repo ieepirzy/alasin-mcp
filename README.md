@@ -287,7 +287,7 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `server.max_request_bytes` | 8 MiB | Largest request body, checked before authentication. |
 | `[[auth.static]]` | | `token_file`/`token_env`, `tenant`, `subject`, `gateway` (may send the trusted author header). Re-read every 30 s, so rotation needs no restart; list two entries to overlap old and new. The Forgejo service token is re-read on every call. |
 | `[auth.jwt]` | | `jwks_url`, `issuer`, `audience`, `algorithms`, `tenant_claim`, `subject_claim`, `name_claim`, `email_claim`, `default_tenant`. |
-| `[auth.oauth]` | | The OAuth front door; see *OAuth sign-in*. `provider` (`origo`), `tenant` (a `service_account` tenant), `base_url` (default `server.public_url`; its host must be in `server.allowed_hosts`), `public_registration` (`false`; see the warning under *OAuth sign-in*), `allow_unauthenticated_consent` (`false`; the approve-only page, without an IdP), `auto_approve` (`false`; only with the previous), `token_ttl_seconds` (3600), `refresh_token_ttl_seconds` (30 days), `client_ttl_seconds`, `storage_path` (`/var/lib/alasin/oauth.db`; `""` = memory). |
+| `[auth.oauth]` | | The OAuth front door; see *OAuth sign-in*. `provider` (`origo`), `tenant` (a `service_account` tenant), `base_url` (default `server.public_url`; its host must be in `server.allowed_hosts`), `public_registration` (`false`; see the warning under *OAuth sign-in*), `cimd_allowed_clients` (exact https client_id URLs, e.g. claude.ai's `https://claude.ai/oauth/mcp-oauth-client-metadata`, that sign in without a pre-registered client; `/register` stays off, works with `identity_provider`), `allow_unauthenticated_consent` (`false`; the approve-only page, without an IdP), `auto_approve` (`false`; only with the previous), `token_ttl_seconds` (3600), `refresh_token_ttl_seconds` (30 days), `client_ttl_seconds`, `storage_path` (`/var/lib/alasin/oauth.db`; `""` = memory). |
 | `[[auth.oauth.clients]]` | | `id`, `secret_file`/`secret_env`, `redirect_uris` (exact match). Read at start-up: a new secret needs a restart. |
 | `[auth.oauth.identity_provider]` | | Per-person sign-in; see *OAuth sign-in*. `issuer` (https, exactly as in the IdP's tokens), `client_id`, `client_secret_file`/`_env` (read at start-up), `allowed_groups` (required, non-empty, exactly as emitted), `groups_claim` (`groups`; a dotted path reaches nested claims), `allowed_email_domains` (`[]`), `max_grant_age_seconds` (43200). |
 | `ALASIN_IDP_ISSUER`, `ALASIN_IDP_CLIENT_ID`, `ALASIN_IDP_CLIENT_SECRET_FILE`, `ALASIN_IDP_ALLOWED_GROUPS`, `ALASIN_IDP_GROUPS_CLAIM`, `ALASIN_IDP_MAX_GRANT_AGE` (seconds) | | Environment variables that set the identity provider instead of the table above (never both; `[auth.oauth]` must still be in the file). `ALASIN_IDP_ALLOWED_GROUPS` is comma-separated. |
@@ -353,7 +353,8 @@ verified it, the name and the groups. The MCP client is still one pre-registered
   the Forgejo service account.
 - The config refuses an inconsistent tenant: it needs `author_source = "token_claims"`
   and `branch_owners = true`, may have no `[[auth.static]]` credentials (they are
-  shared accounts), `public_registration` can't be on, and `[auth.jwt]` can't be
+  shared accounts), `public_registration` can't be on (list connector platforms in
+  `cimd_allowed_clients` instead), and `[auth.jwt]` can't be
   configured at all (a JWT's tenant comes from a claim, so it could reach this tenant).
 - Commit messages can't carry `Co-authored-by` or `Signed-off-by` trailers (except the
   configured `agent_coauthor`, which the server adds anyway): the commit is attributed to
