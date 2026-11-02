@@ -43,7 +43,7 @@ requires-dist = [
     { name = "opentelemetry-api", specifier = "==1.45.1" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = "==1.45.1" },
     { name = "opentelemetry-sdk", specifier = "==1.45.1" },
-    { name = "origo", marker = "extra == 'origo'", url = "https://github.com/ieepirzy/origo/archive/6fa218f383fad01826d2df5025ab4aebd0621774.tar.gz" },
+    { name = "origo", marker = "extra == 'origo'", url = "https://github.com/ieepirzy/origo/archive/5ab3ee8d3e222c35f84d538a3ed6fbad543d0893.tar.gz" },
     { name = "pyjwt", extras = ["crypto"], specifier = "==2.15.1" },
     { name = "starlette", specifier = "==1.8.0" },
     { name = "uvicorn", specifier = "==0.54.0" },
@@ -661,14 +661,14 @@ wheels = [
 [[package]]
 name = "origo"
 version = "0.4.0"
-source = { url = "https://github.com/ieepirzy/origo/archive/6fa218f383fad01826d2df5025ab4aebd0621774.tar.gz" }
+source = { url = "https://github.com/ieepirzy/origo/archive/5ab3ee8d3e222c35f84d538a3ed6fbad543d0893.tar.gz" }
 dependencies = [
     { name = "anyio" },
     { name = "cryptography" },
     { name = "python-multipart" },
     { name = "starlette" },
 ]
-sdist = { hash = "sha256:3bb0b262af33d596bbae262752c913bb05a2c9049ec3885a52fe652b460f9edc" }
+sdist = { hash = "sha256:7f47bda64e32f751dbf11f1e9002e6a84fd92dbbc9d9633517fbca9c6d0503a1" }
 
 [package.metadata]
 requires-dist = [
