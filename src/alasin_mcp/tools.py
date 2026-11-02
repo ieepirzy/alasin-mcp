@@ -744,19 +744,35 @@ def build_server(services: Services) -> MCPServer:
     async def list_repos(ctx: Context, session_id: SessionId) -> dict[str, Any]:
         async def body(call: Call) -> dict[str, Any]:
             cred = await call.credential(None)
+            # Repos the configuration names outright are looked up one by one,
+            # which needs only the repository scope: a repo-scoped token gets
+            # 403 (no read:user) from /user/repos. Only patterns need the listing.
+            literal = [p for p in call.tenant.repos if not set(p) & set("*?[")]
+            repos: list[dict[str, Any]] = []
             async with call.client(cred) as client:
-                repos = await client.user_repos()
-            out = [
-                {
-                    "repo": r["full_name"],
-                    "default_branch": r.get("default_branch"),
-                    "description": r.get("description") or "",
-                    "archived": bool(r.get("archived")),
-                }
-                for r in repos
-                if isinstance(r.get("full_name"), str) and repo_allowed(call.tenant, r["full_name"])
-            ]
-            return {"repos": out}
+                for name in literal:
+                    try:
+                        repos.append(await client.repo(validation.repo(name)))
+                    except ForgejoError as e:
+                        if e.status not in (403, 404):
+                            raise
+                if len(literal) < len(call.tenant.repos):
+                    repos.extend(await client.user_repos())
+            out: dict[str, dict[str, Any]] = {}
+            for r in repos:
+                if isinstance(r.get("full_name"), str) and repo_allowed(
+                    call.tenant, r["full_name"]
+                ):
+                    out.setdefault(
+                        r["full_name"].casefold(),
+                        {
+                            "repo": r["full_name"],
+                            "default_branch": r.get("default_branch"),
+                            "description": r.get("description") or "",
+                            "archived": bool(r.get("archived")),
+                        },
+                    )
+            return {"repos": list(out.values())}
 
         return await services.call(ctx, "list_repos", {}, session_id, body)
 

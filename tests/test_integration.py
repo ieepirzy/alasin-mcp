@@ -115,6 +115,9 @@ async def test_full_change_flow(forgejo, monkeypatch, spans) -> None:
         assert [format(link.context.trace_id, "032x") for link in begin[-1].links] == [client_trace]
         repos = await ok(url, "list_repos", {"session_id": sid})
         assert [r["repo"] for r in repos["repos"]] == ["acme/site"]  # acme/other not allowlisted
+        # A literal allowlist is looked up repo by repo: /user/repos needs
+        # read:user, which a repo-scoped token lacks (403 on the lane).
+        assert ("GET", "/api/v1/user/repos") not in rec.methods
         base = {"session_id": sid, "repo": "acme/site"}
         br = await ok(url, "list_branches", base)
         assert br["default_branch"] == "main"
@@ -287,6 +290,10 @@ async def test_tenant_a_cannot_reach_tenant_b_on_a_real_instance(forgejo, monkey
             token="tok-b",
         )
         assert "private" in f["content"]
+        # A pattern ("root/*") still needs the listing, filtered to the pattern.
+        listed = await ok(url, "list_repos", {"session_id": b_sid}, token="tok-b")
+        assert "root/private" in [r["repo"] for r in listed["repos"]]
+        assert all(r["repo"].startswith("root/") for r in listed["repos"])
     a_side = [x for x in rec.seen if x[2] == forgejo.bot_token]
     b_side = [x for x in rec.seen if x[2] == forgejo.admin_token]
     assert all(h == f"127.0.0.1:{forgejo.port}" for h, _, _ in a_side)
