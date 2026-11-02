@@ -202,7 +202,7 @@ class OrigoFrontDoor:
     ):
         self._tenant = cfg.tenant
         self._audit_sink = audit_sink
-        known_client_ids(c.id for c in cfg.clients)
+        known_client_ids([*(c.id for c in cfg.clients), *cfg.cimd_allowed_clients])
         self._client_ip = client_ip or ClientIpPolicy()
         try:
             from origo import OAuthProvider
@@ -216,7 +216,10 @@ class OrigoFrontDoor:
             base_url=base_url,
             clients={c.id: c.secret.resolve() for c in cfg.clients},
             client_redirect_uris={c.id: list(c.redirect_uris) for c in cfg.clients},
-            public_registration=cfg.public_registration,
+            # origo resolves a CIMD client_id only in its public mode; with the
+            # allowlist set it accepts just those URLs and turns /register off.
+            public_registration=cfg.public_registration or bool(cfg.cimd_allowed_clients),
+            cimd_allowed_clients=list(cfg.cimd_allowed_clients) or None,
             auto_approve=cfg.auto_approve,
             token_ttl=cfg.token_ttl_seconds,
             refresh_token_ttl=cfg.refresh_token_ttl_seconds,

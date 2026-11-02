@@ -649,3 +649,72 @@ def test_from_config_gates_the_person_tenant(
     }
     from_config(parse({**BASE, "server": server, "auth": _auth(storage_path="")}))
     assert built[0].writer_groups == {"t": frozenset({LANE})}
+
+
+# claude.ai's connector names itself with a Client ID Metadata Document URL
+# (Ilari, 2026-11-02: people on claude.ai sign in through Keycloak, with no
+# pre-registered client). Only listed URLs; nothing can register itself.
+CLAUDE = "https://claude.ai/oauth/mcp-oauth-client-metadata"
+
+
+def test_cimd_allowlist_config() -> None:
+    auth = _auth(cimd_allowed_clients=[CLAUDE])
+    del auth["oauth"]["clients"]
+    cfg = parse({**BASE, "auth": auth})
+    assert cfg.oauth is not None and cfg.oauth.cimd_allowed_clients == (CLAUDE,)
+    assert not cfg.oauth.public_registration and not cfg.oauth.clients
+    for bad in ("claude.ai", "http://claude.ai/x", "https://claude.ai", "https:///x"):
+        with pytest.raises(ConfigError, match="cimd_allowed_clients"):
+            parse({**BASE, "auth": _auth(cimd_allowed_clients=[bad])})
+    both = _auth(
+        cimd_allowed_clients=[CLAUDE],
+        public_registration=True,
+        public_registration_i_understand_anyone_can_connect=True,
+    )
+    with pytest.raises(ConfigError, match="exclude each other"):
+        parse({**BASE, "auth": both})
+
+
+async def test_cimd_allowlist_admits_only_listed_clients(monkeypatch: pytest.MonkeyPatch) -> None:
+    cb = "https://claude.ai/api/mcp/auth_callback"
+    fetched: list[str] = []
+
+    def fake_fetch(url: str, allow_private_hosts: bool = False) -> dict[str, Any]:
+        fetched.append(url)
+        return {"client_id": url, "redirect_uris": [cb], "token_endpoint_auth_method": "none"}
+
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
+    port = free_port()
+    base = f"http://127.0.0.1:{port}"
+    cfg = OAuthServerConfig(
+        tenant="t", cimd_allowed_clients=(CLAUDE,), identity_provider=_idp(), storage_path=""
+    )
+    door = OrigoFrontDoor(cfg, base, "/mcp")
+    services = fake_services(_fake(), [_tenant()])
+    with serve(build_app(services, StaticTokenVerifier([]), oauth=door), port):
+        async with httpx.AsyncClient(follow_redirects=False, timeout=10) as h:
+
+            async def authorize(client_id: str) -> httpx.Response:
+                return await h.get(
+                    f"{base}/authorize",
+                    params={
+                        "response_type": "code",
+                        "client_id": client_id,
+                        "redirect_uri": cb,
+                        "code_challenge": "x" * 43,
+                        "code_challenge_method": "S256",
+                    },
+                )
+
+            other = await authorize("https://evil.example.com/client.json")
+            assert other.status_code == 401 and "unauthorized_client" in other.text
+            listed = await authorize(CLAUDE)
+            assert listed.status_code != 401, listed.text
+            # Accepted, then handed to the IdP; with no reachable IdP in the
+            # test, origo reports that to the client's own callback.
+            loc = listed.headers.get("location", "")
+            assert listed.status_code == 302 and loc.startswith(cb + "?"), (listed.status_code, loc)
+            assert "unauthorized_client" not in loc
+            assert fetched == [CLAUDE]  # the unlisted URL is never fetched
+            reg = await h.post(f"{base}/register", json={"redirect_uris": [cb]})
+            assert reg.status_code >= 400 and reg.status_code != 500, reg.text

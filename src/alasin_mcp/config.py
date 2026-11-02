@@ -207,6 +207,10 @@ class OAuthServerConfig:
     base_url: str = ""
     clients: tuple[OAuthClientConfig, ...] = ()
     public_registration: bool = False
+    # Exact CIMD client_id URLs (claude.ai's connector identifies itself with
+    # one) that may sign in without being listed under clients. Nothing can
+    # register itself: origo turns /register off when this list is set.
+    cimd_allowed_clients: tuple[str, ...] = ()
     auto_approve: bool = False
     token_ttl_seconds: int = 3600
     refresh_token_ttl_seconds: int = 30 * 24 * 3600
@@ -490,8 +494,20 @@ def _oauth_server(raw: dict[str, Any], server: ServerConfig) -> OAuthServerConfi
             "auth.oauth public_registration lets anyone who can reach this server get a "
             f"token for the tenant; to accept that, also set {PUBLIC_REGISTRATION_ACK} = true"
         )
-    if not clients and not public:
-        raise ConfigError("auth.oauth: add [[auth.oauth.clients]] or set public_registration")
+    cimd = tuple(str(u) for u in raw.get("cimd_allowed_clients", ()))
+    for u in cimd:
+        parsed = urlsplit(u)
+        if parsed.scheme != "https" or not parsed.hostname or not parsed.path.strip("/"):
+            raise ConfigError(f"auth.oauth cimd_allowed_clients: {u!r} is not an exact https client_id URL")
+    if cimd and public:
+        raise ConfigError(
+            "auth.oauth: cimd_allowed_clients and public_registration exclude each other; "
+            "the list exists so that nothing else can register"
+        )
+    if not clients and not public and not cimd:
+        raise ConfigError(
+            "auth.oauth: add [[auth.oauth.clients]], cimd_allowed_clients or public_registration"
+        )
     client_ttl = raw.get("client_ttl_seconds")
     idp = _identity_provider(raw["identity_provider"]) if "identity_provider" in raw else None
     if idp is not None and public:
@@ -505,6 +521,7 @@ def _oauth_server(raw: dict[str, Any], server: ServerConfig) -> OAuthServerConfi
         base_url=base_url,
         clients=clients,
         public_registration=public,
+        cimd_allowed_clients=cimd,
         auto_approve=bool(raw.get("auto_approve", False)),
         token_ttl_seconds=int(raw.get("token_ttl_seconds", 3600)),
         refresh_token_ttl_seconds=int(raw.get("refresh_token_ttl_seconds", 30 * 24 * 3600)),
