@@ -19,14 +19,19 @@ Licence: [Apache-2.0](LICENSE).
 
 ## Tools
 
+Every result stays well under a client's tool-result limit (claude.ai cuts at about
+25k tokens): the caps below are server-side, and a result that was cut says
+`truncated: true`.
+
 | Tool | Kind | What it does |
 |---|---|---|
-| `begin_change` | start | Opens a work session. Returns `session_id` (required by every other tool) and the `trace_id` stamped into commits. |
+| `whoami` | read | Who the server thinks you are: subject, IdP subject, name and email, tenant, auth mode, the groups in your sign-in token (`null` if it carries none), and the tenant's repo patterns and protected branches. Needs no session. |
+| `begin_change` | start | Opens a work session. Returns `session_id` (required by every other tool), the `trace_id` stamped into commits, the tenant and its repo patterns. |
 | `list_repos` | read | Repositories the tenant may reach (the tenant's allowlist ∩ what the Forgejo account can see). |
 | `list_branches` | read | Branches, with whether each is protected. |
-| `list_folder` | read | A folder's entries at a ref (default branch by default). |
-| `read_file` | read | A file at a ref; text as UTF-8, anything else as base64; size-capped. |
-| `diff_branch` | read | A branch's commits and a unified diff per file against the default branch (or `base`), from the merge base. |
+| `list_folder` | read | A folder's entries at a ref (default branch by default), at most 500 (`total_entries`, `truncated`). |
+| `read_file` | read | A file at a ref; text as UTF-8, anything else as base64. At most 60 KB per call: text comes back in line windows (`start_line`, optional `max_lines`), and the result gives `end_line`, `total_lines`, `truncated` and `next_start_line` to continue. |
+| `diff_branch` | read | A branch's commits and a unified diff per file against the default branch (or `base`), from the merge base. At most 60 KB of diff, 50 files and 100 commits; `truncated` says when something was left out. |
 | `create_branch` | write | A new branch from the default branch (or `from_ref`). |
 | `commit_files` | write | One commit with several files (`POST /repos/{owner}/{repo}/contents`), each created or replaced in full. |
 

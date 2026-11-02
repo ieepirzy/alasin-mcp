@@ -87,6 +87,7 @@ WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world
 
 # The exact tool set. tests/test_tool_surface.py fails if this changes.
 TOOL_NAMES = (
+    "whoami",
     "begin_change",
     "list_repos",
     "list_branches",
@@ -103,8 +104,14 @@ RESERVED_TRAILERS = ("trace-id", "alasin-session")
 # caller; the message can't name anyone else. The configured agent co-author
 # alone may be written out (the server adds it anyway).
 ATTRIBUTION_TRAILERS = ("co-authored-by", "signed-off-by")
+# Output caps, so that one tool result stays well under a client's limit
+# (claude.ai cuts a tool result at about 25k tokens; 60 KB of text is about
+# 15k). A result that is cut says truncated: true and how to continue.
+MAX_READ_BYTES = 60_000
 MAX_DIFF_FILES = 50
-MAX_DIFF_CHARS = 200_000
+MAX_DIFF_CHARS = 60_000
+MAX_DIFF_COMMITS = 100
+MAX_FOLDER_ENTRIES = 500
 _TRAILER_LINE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*: .+$")
 _IDENTITY = re.compile(r"^\s*([^<>\r\n]+?)\s*<([^<>\s@]+@[^<>\s@]+)>\s*$")
 
@@ -468,6 +475,8 @@ _RESULT_KEEP = frozenset(
         "encoding",
         "truncated",
         "files_changed",
+        "tenant",
+        "auth_mode",
     }
 )
 
@@ -702,11 +711,100 @@ def _text_or_none(data: bytes | None) -> list[str] | None:
         return None
 
 
+def _decode_text(data: bytes, cut: bool) -> str | None:
+    """The bytes as text, or None for binary. When ``cut`` (the read stopped at
+    a byte limit) a character split at the very end is dropped, not taken
+    as a sign of binary content."""
+    if b"\x00" in data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        if cut and e.start >= len(data) - 3:
+            try:
+                return data[: e.start].decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+        return None
+
+
+def _line_window(text: str, start_line: int, max_lines: int, cut: bool) -> dict[str, Any]:
+    """Lines ``start_line``.. of ``text``, as many as fit in MAX_READ_BYTES
+    (and at most ``max_lines`` when set), with what a caller needs to go on."""
+    lines = text.splitlines(keepends=True)
+    total = len(lines)
+    if total and start_line > total:
+        raise InvalidInput(f"start_line {start_line} is past the end ({total} lines)")
+    first = start_line - 1
+    budget = MAX_READ_BYTES
+    taken: list[str] = []
+    note = None
+    for line in lines[first:]:
+        if max_lines and len(taken) >= max_lines:
+            break
+        size = len(line.encode("utf-8"))
+        if size > budget:
+            if not taken:
+                # One line longer than the cap (minified code): its start only.
+                part = line.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+                taken.append(part)
+                note = f"line {start_line} is longer than {MAX_READ_BYTES} bytes; only its start is shown"
+            break
+        taken.append(line)
+        budget -= size
+    end = first + len(taken)
+    more = end < total
+    window: dict[str, Any] = {
+        "content": "".join(taken),
+        "start_line": start_line,
+        "end_line": end,
+        "total_lines": total,
+        # More lines, a cut line, or a file longer than the tenant's read limit.
+        "truncated": more or note is not None or cut,
+        "next_start_line": end + 1 if more else None,
+    }
+    if note:
+        window["note"] = note
+    elif cut and not more:
+        window["note"] = "the file is longer than this server reads; the rest is not available"
+    return window
+
+
 # -- the server ---------------------------------------------------------------------------
 
 
 def build_server(services: Services) -> MCPServer:
     server = MCPServer(name="alasin-mcp", instructions=INSTRUCTIONS)
+
+    @server.tool(
+        description=(
+            "Show who the server thinks you are: your identity, tenant, sign-in "
+            "groups and the repositories you may work in. Needs no session."
+        ),
+        annotations=READ_ONLY,
+        structured_output=True,
+    )
+    async def whoami(ctx: Context) -> dict[str, Any]:
+        async def body(call: Call) -> dict[str, Any]:
+            principal, tenant = call.principal, call.tenant
+            groups = principal.claims.get("groups")
+            return {
+                "tenant": tenant.id,
+                "auth_mode": tenant.auth_mode.value,
+                "subject": principal.subject,
+                "idp_subject": principal.idp_subject,
+                "name": principal.name,
+                "email": principal.email,
+                "email_verified": principal.email_verified,
+                # None when the credential carries no groups claim at all.
+                "groups": [g for g in groups if isinstance(g, str)]
+                if isinstance(groups, list)
+                else None,
+                "repos": list(tenant.repos),
+                "protected_branches": list(tenant.protected_branches),
+            }
+
+        return await services.call(ctx, "whoami", {}, None, body)
 
     @server.tool(
         description=(
@@ -732,6 +830,8 @@ def build_server(services: Services) -> MCPServer:
                 "session_id": session.session_id,
                 "trace_id": session.trace_id,
                 "expires_at": int(session.expires_at),
+                "tenant": call.tenant.id,
+                "repos": list(call.tenant.repos),
             }
 
         return await services.call(ctx, "begin_change", {"intent": intent}, None, body)
@@ -836,8 +936,10 @@ def build_server(services: Services) -> MCPServer:
                         "type": e.get("type"),
                         "size": e.get("size"),
                     }
-                    for e in listing
+                    for e in listing[:MAX_FOLDER_ENTRIES]
                 ],
+                "total_entries": len(listing),
+                "truncated": len(listing) > MAX_FOLDER_ENTRIES,
             }
 
         args = {"repo": repo, "path": path, "ref": ref}
@@ -845,12 +947,22 @@ def build_server(services: Services) -> MCPServer:
 
     @server.tool(
         description="Read a file. ref defaults to the default branch. Text comes back as "
-        "utf-8, anything else as base64.",
+        f"utf-8, anything else as base64. At most {MAX_READ_BYTES // 1000} KB per call: a "
+        "longer text file comes back in line ranges, with truncated: true and "
+        "next_start_line to pass as start_line for the rest.",
         annotations=READ_ONLY,
         structured_output=True,
     )
     async def read_file(
-        ctx: Context, session_id: SessionId, repo: RepoArg, path: str, ref: str = ""
+        ctx: Context,
+        session_id: SessionId,
+        repo: RepoArg,
+        path: str,
+        ref: str = "",
+        start_line: Annotated[int, Field(ge=1, description="First line to return (1-based).")] = 1,
+        max_lines: Annotated[
+            int, Field(ge=0, description="Most lines to return; 0 means as many as fit.")
+        ] = 0,
     ) -> dict[str, Any]:
         async def body(call: Call) -> dict[str, Any]:
             r = call.check_repo(repo)
@@ -877,23 +989,28 @@ def build_server(services: Services) -> MCPServer:
                 }
             data = base64.b64decode(meta.get("content") or "")
             limit = call.tenant.max_file_bytes
-            truncated = len(data) > limit
+            cut = len(data) > limit
             data = data[:limit]
-            lines = _text_or_none(data)
-            if lines is not None:
-                content, encoding = data.decode("utf-8", errors="ignore"), "utf-8"
-            else:
-                content, encoding = base64.b64encode(data).decode(), "base64"
-            return {
-                "path": p,
-                "sha": meta.get("sha"),
-                "size": meta.get("size"),
-                "encoding": encoding,
-                "truncated": truncated,
-                "content": content,
-            }
+            text = _decode_text(data, cut)
+            out: dict[str, Any] = {"path": p, "sha": meta.get("sha"), "size": meta.get("size")}
+            if text is None:
+                # base64 grows 4/3: keep the encoded form within the cap.
+                raw_cap = min(limit, MAX_READ_BYTES * 3 // 4)
+                return {
+                    **out,
+                    "encoding": "base64",
+                    "truncated": cut or len(data) > raw_cap,
+                    "content": base64.b64encode(data[:raw_cap]).decode(),
+                }
+            return {**out, "encoding": "utf-8", **_line_window(text, start_line, max_lines, cut)}
 
-        args = {"repo": repo, "path": path, "ref": ref}
+        args = {
+            "repo": repo,
+            "path": path,
+            "ref": ref,
+            "start_line": start_line,
+            "max_lines": max_lines,
+        }
         return await services.call(ctx, "read_file", args, session_id, body)
 
     @server.tool(
@@ -967,10 +1084,15 @@ def build_server(services: Services) -> MCPServer:
                         "sha": c["sha"],
                         "message": ((c.get("commit") or {}).get("message") or "")[:2000],
                     }
-                    for c in commits
+                    for c in commits[:MAX_DIFF_COMMITS]
                 ],
+                "commit_count": len(commits),
                 "files_changed": len(files),
                 "files": diffs,
+                "truncated": budget < 0
+                or any(d.get("note", "").startswith("diff omitted") for d in diffs)
+                or len(files) > MAX_DIFF_FILES
+                or len(commits) > MAX_DIFF_COMMITS,
             }
 
         args = {"repo": repo, "branch": branch, "base": base}
