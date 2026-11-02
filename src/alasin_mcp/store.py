@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Durable state: work sessions, delegated tokens, OAuth flow state and branch
-owners (SQLite).
+"""Durable state: work sessions, delegated tokens, OAuth flow state, branch
+owners and git access tokens (SQLite).
 
 Isolation rules this module enforces:
 
@@ -15,6 +15,7 @@ Isolation rules this module enforces:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import secrets
@@ -71,6 +72,19 @@ CREATE TABLE IF NOT EXISTS branch_owners (
     confirmed_at REAL,
     PRIMARY KEY (tenant, repo, branch)
 );
+-- git_access credentials. Only the token's SHA-256 is stored: the row can't
+-- be turned back into a working credential.
+CREATE TABLE IF NOT EXISTS git_tokens (
+    token_sha256 TEXT PRIMARY KEY,
+    tenant TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    idp_subject TEXT,
+    repo TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
 """
 
 
@@ -117,6 +131,23 @@ class WorkSession:
     intent: str
     created_at: float
     expires_at: float
+
+
+@dataclass(frozen=True)
+class GitToken:
+    """What a git_access credential allows: one person, one repo, one branch."""
+
+    tenant: str
+    subject: str
+    idp_subject: str | None
+    repo: str
+    branch: str
+    session_id: str
+    expires_at: float
+
+
+def _token_sha256(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -317,3 +348,45 @@ class Store:
             (tenant, repo.casefold(), branch),
         )
         return rows[0][0] if rows else None
+
+    # -- git access tokens (tenants with git_access) ----------------------------------
+
+    def put_git_token(
+        self,
+        tenant: str,
+        subject: str,
+        idp_subject: str | None,
+        repo: str,
+        branch: str,
+        session_id: str,
+        ttl: float,
+    ) -> tuple[str, float]:
+        """Mint a credential for one branch; return it and when it expires.
+        The credential itself is never stored, only its SHA-256."""
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        self._q("DELETE FROM git_tokens WHERE expires_at < ?", (now,))
+        self._q(
+            "INSERT INTO git_tokens VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _token_sha256(token),
+                tenant,
+                subject,
+                idp_subject,
+                repo,
+                branch,
+                session_id,
+                now,
+                now + ttl,
+            ),
+        )
+        return token, now + ttl
+
+    def get_git_token(self, token: str) -> GitToken | None:
+        """The live credential's grant, or None (unknown or expired)."""
+        rows = self._q(
+            "SELECT tenant, subject, idp_subject, repo, branch, session_id, expires_at"
+            " FROM git_tokens WHERE token_sha256 = ? AND expires_at > ?",
+            (_token_sha256(token), time.time()),
+        )
+        return GitToken(*rows[0]) if rows else None

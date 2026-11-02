@@ -101,6 +101,25 @@ class PlatformConfig:
 
 
 @dataclass(frozen=True)
+class GitAccessConfig:
+    """Plain git over HTTPS through this server (``git_access`` and ``/git/``).
+
+    ``git_access`` hands the caller a short-lived URL for one branch; the
+    server checks every push against it and forwards git's smart HTTP to
+    Forgejo with the tenant's service token. Off unless a tenant enables it.
+    """
+
+    # The server's public origin, as git clients reach it (https://host).
+    public_url: str
+    ttl_seconds: int = 900
+    # A larger push is cut off and fails; Cloudflare's own limit is 100 MB.
+    max_push_bytes: int = 100 * 1024 * 1024
+    # Proxied git requests per minute for one person (a clone or a push is
+    # two or three requests).
+    requests_per_minute: int = 60
+
+
+@dataclass(frozen=True)
 class BranchWebhookConfig:
     """Where branch-creation requests go when branch_creation = "webhook"."""
 
@@ -140,6 +159,7 @@ class TenantConfig:
     # branch with no record (made elsewhere, or before the state was lost) is
     # refused. Required for a tenant whose people sign in through an IdP.
     branch_owners: bool = False
+    git_access: GitAccessConfig | None = None
 
     @property
     def api_base(self) -> str:
@@ -318,6 +338,7 @@ def _tenant(raw: dict[str, Any]) -> TenantConfig:
             raise ConfigError(f"tenant {tid}: branch_webhook needs secret_file or secret_env")
         if not 0 < webhook.timeout_seconds <= 600 or webhook.poll_interval_seconds <= 0:
             raise ConfigError(f"tenant {tid}: branch_webhook timing out of range")
+    git_access = _git_access(tid, raw["git_access"]) if "git_access" in raw else None
     creation = str(raw.get("branch_creation", "api"))
     if creation == "webhook" and webhook is None:
         raise ConfigError(f"tenant {tid}: branch_creation=webhook needs [tenants.branch_webhook]")
@@ -343,9 +364,17 @@ def _tenant(raw: dict[str, Any]) -> TenantConfig:
         branch_creation=creation,
         branch_webhook=webhook,
         branch_owners=bool(raw.get("branch_owners", False)),
+        git_access=git_access,
     )
     if mode is AuthMode.SERVICE_ACCOUNT and not tenant.service_token.configured:
         raise ConfigError(f"tenant {tid}: service_account mode needs service_token_file/_env")
+    if git_access is not None and (
+        mode is not AuthMode.SERVICE_ACCOUNT or not tenant.branch_owners
+    ):
+        # The proxy pushes with the service token, for the branch's owner only.
+        raise ConfigError(
+            f"tenant {tid}: git_access needs auth_mode = service_account and branch_owners = true"
+        )
     if mode is AuthMode.USER_DELEGATED and oauth is None:
         raise ConfigError(f"tenant {tid}: user_delegated mode needs an [tenants.oauth] table")
     return tenant
@@ -631,6 +660,28 @@ def _check_oauth(
             f"tenant {tenant.id}: [[auth.static]] credentials are shared accounts; remove them "
             "from a tenant whose people sign in through auth.oauth.identity_provider"
         )
+
+
+def _git_access(tid: str, raw: dict[str, Any]) -> GitAccessConfig | None:
+    if not bool(raw.get("enabled", False)):
+        return None
+    public_url = str(raw.get("public_url", "")).rstrip("/")
+    parts = urlsplit(public_url)
+    if parts.scheme != "https" or not parts.hostname or parts.path or parts.query:
+        raise ConfigError(f"tenant {tid}: git_access.public_url must be https://host, no path")
+    cfg = GitAccessConfig(
+        public_url=public_url,
+        ttl_seconds=int(raw.get("ttl_seconds", 900)),
+        max_push_bytes=int(raw.get("max_push_bytes", 100 * 1024 * 1024)),
+        requests_per_minute=int(raw.get("requests_per_minute", 60)),
+    )
+    if not 60 <= cfg.ttl_seconds <= 3600:
+        raise ConfigError(f"tenant {tid}: git_access.ttl_seconds must be 60..3600")
+    if not 1024 <= cfg.max_push_bytes <= 1024 * 1024 * 1024:
+        raise ConfigError(f"tenant {tid}: git_access.max_push_bytes out of range")
+    if cfg.requests_per_minute < 1:
+        raise ConfigError(f"tenant {tid}: git_access.requests_per_minute must be positive")
+    return cfg
 
 
 def load(path: str | os.PathLike[str]) -> Config:

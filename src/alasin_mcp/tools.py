@@ -17,8 +17,10 @@ In a tenant with ``branch_owners``, ``create_branch`` records the caller as
 the branch's owner and ``commit_files`` refuses a branch it has no owner for,
 or whose owner is someone else.
 
-The tool set is fixed: reads, ``create_branch`` and ``commit_files``. There
-is no tool to merge, delete, change settings, administer or read secrets.
+The tool set is fixed: reads, ``create_branch``, ``commit_files`` and
+``git_access`` (a short-lived git URL for one of the caller's branches, served
+by gitproxy.py). There is no tool to merge, delete, change settings,
+administer or read secrets.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ import hashlib
 import json
 import logging
 import re
+import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
@@ -97,8 +100,9 @@ TOOL_NAMES = (
     "diff_branch",
     "create_branch",
     "commit_files",
+    "git_access",
 )
-WRITE_TOOLS = frozenset({"create_branch", "commit_files"})
+WRITE_TOOLS = frozenset({"create_branch", "commit_files", "git_access"})
 
 RESERVED_TRAILERS = ("trace-id", "alasin-session")
 # Trailers that attribute a commit to someone. The author is the verified
@@ -487,8 +491,10 @@ _RESULT_KEEP = frozenset(
 # Results that name a person (whoami, commit_files) leave these out entirely:
 # a digest of an email or a name is guessable, so not even that is written.
 _RESULT_PEOPLE = frozenset(
-    {"author", "committer", "name", "email", "subject", "idp_subject", "groups"}
+    {"author", "committer", "name", "email", "subject", "idp_subject", "groups", "git_config"}
 )
+# Results carrying a credential (git_access's URL) leave it out entirely.
+_RESULT_SECRET = frozenset({"clone_url"})
 
 
 def _result_summary(result: dict[str, Any], *, owner_named: bool = False) -> dict[str, Any]:
@@ -499,7 +505,7 @@ def _result_summary(result: dict[str, Any], *, owner_named: bool = False) -> dic
     repo itself (``owner_named``: the configuration names that owner)."""
     out: dict[str, Any] = {}
     for k, v in result.items():
-        if k in _RESULT_PEOPLE:
+        if k in _RESULT_PEOPLE or k in _RESULT_SECRET:
             continue  # people: the commit records authors, the event the sub
         if k == "url" and not owner_named and isinstance(v, str):
             out.update(digest(k, v))
@@ -609,6 +615,45 @@ def check_owner(call: Call, repo: RepoRef, branch: str) -> None:
             "create your own branch with create_branch and commit there (if you did create "
             "it, call create_branch for it again to confirm)"
         )
+
+
+def new_branch_name(tenant: TenantConfig) -> str:
+    """A fresh work-branch name under the tenant's prefix."""
+    return f"{tenant.branch_prefix}change-{secrets.token_hex(4)}"
+
+
+async def create_owned_branch(
+    call: Call,
+    client: ForgejoClient,
+    repo: RepoRef,
+    canonical: RepoRef,
+    name: str,
+    info: dict[str, Any],
+) -> str | None:
+    """Create a branch from the default branch for the caller, recording them
+    as its owner, the way create_branch does."""
+    assert call.session is not None
+    source = str(info["default_branch"])
+    creator = call.services.branch_creator(call.tenant)
+    await call.record_attempt(
+        "create_branch", branch=name, from_ref=source, method=call.tenant.branch_creation
+    )
+    reserve_branch(call, repo, name)
+    try:
+        sha = await creator.create(
+            BranchRequest(
+                call.tenant, call.principal, call.session.session_id, canonical, name, source
+            ),
+            client,
+        )
+    except BaseException:
+        if call.tenant.branch_owners:
+            call.services.store.release_branch(
+                call.tenant.id, repo.full_name, name, call.principal.subject
+            )
+        raise
+    confirm_owner(call, repo, name)
+    return sha
 
 
 def parse_identity(value: str) -> Identity | None:
@@ -1357,5 +1402,62 @@ def build_server(services: Services) -> MCPServer:
             "author_email": author_email,
         }
         return await services.call(ctx, "commit_files", args, session_id, body)
+
+    @server.tool(
+        description="Get plain git access to one of your work branches: a clone URL with a "
+        "short-lived credential in it. Use it with ordinary git in your sandbox (git clone, "
+        "commit, git push origin <branch>). Without a branch, a new one is made for you. Only "
+        "that branch can be pushed; ask again for a fresh URL once it expires.",
+        annotations=WRITE,
+        structured_output=True,
+    )
+    async def git_access(
+        ctx: Context, session_id: SessionId, repo: RepoArg, branch: str = ""
+    ) -> dict[str, Any]:
+        async def body(call: Call) -> dict[str, Any]:
+            assert call.session is not None
+            cfg = call.tenant.git_access
+            r = call.check_repo(repo)
+            if cfg is None:
+                raise PolicyError("git access is not enabled on this server")
+            name = validation.branch(branch) if branch else new_branch_name(call.tenant)
+            call.audit["branch"] = name
+            cred = await call.credential(r)
+            async with call.client(cred) as client:
+                info = await call.repo_info(client, r)
+                await check_writable(call, client, r, name, info)
+                canonical = canonical_repo(r, info)
+                if await client.branch(r, name) is None:
+                    await create_owned_branch(call, client, r, canonical, name, info)
+                else:
+                    check_owner(call, r, name)
+            await call.record_attempt("git_access", branch=name)
+            token, expires = call.services.store.put_git_token(
+                call.tenant.id,
+                call.principal.subject,
+                call.principal.idp_subject,
+                canonical.full_name,
+                name,
+                call.session.session_id,
+                cfg.ttl_seconds,
+            )
+            scheme, _, host = cfg.public_url.partition("://")
+            url = f"{scheme}://x-token:{token}@{host}/git/{canonical.full_name}.git"
+            p = call.principal
+            return {
+                "clone_url": url,
+                "branch": name,
+                "expires_at": int(expires),
+                "git_config": {"user.name": p.name or p.subject, "user.email": p.email or ""},
+                "instructions": (
+                    f"git clone --branch {name} <clone_url>; set user.name and user.email from "
+                    f"git_config; commit; git push origin {name}. Only {name} can be pushed. "
+                    "The URL stops working at expires_at: call git_access again for a new one "
+                    "and update it with git remote set-url origin <new clone_url>."
+                ),
+            }
+
+        args = {"repo": repo, "branch": branch}
+        return await services.call(ctx, "git_access", args, session_id, body)
 
     return server

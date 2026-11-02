@@ -266,6 +266,29 @@ def test_static_credential_for_unknown_tenant_refused() -> None:
         parse(bad)
 
 
+def test_git_access_config() -> None:
+    t = {**BASE["tenants"][0], "branch_owners": True}
+    on = {"enabled": True, "public_url": "https://alasin.example.com"}
+    cfg = parse({**BASE, "tenants": [{**t, "git_access": on}]})
+    ga = cfg.tenants[0].git_access
+    assert ga is not None and ga.ttl_seconds == 900 and ga.public_url == on["public_url"]
+    # Off unless enabled.
+    assert parse({**BASE, "tenants": [{**t, "git_access": {}}]}).tenants[0].git_access is None
+    for bad in (
+        {**on, "public_url": "http://alasin.example.com"},
+        {**on, "public_url": "https://alasin.example.com/path"},
+        {**on, "ttl_seconds": 10},
+        {**on, "ttl_seconds": 86400},
+        {**on, "max_push_bytes": 1},
+        {**on, "requests_per_minute": 0},
+    ):
+        with pytest.raises(ConfigError):
+            parse({**BASE, "tenants": [{**t, "git_access": bad}]})
+    # Pushes are for a branch's owner only.
+    with pytest.raises(ConfigError):
+        parse({**BASE, "tenants": [{**BASE["tenants"][0], "git_access": on}]})
+
+
 def test_user_delegated_needs_master_key() -> None:
     t = {
         **BASE["tenants"][0],

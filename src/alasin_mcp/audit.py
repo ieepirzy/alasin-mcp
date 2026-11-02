@@ -79,6 +79,9 @@ _SHAPES: dict[str, re.Pattern[str]] = {
     "commit": re.compile(r"[0-9a-f]{7,64}"),
     "sha": re.compile(r"[0-9a-f]{7,64}"),
     "merge_base": re.compile(r"[0-9a-f]{7,64}"),
+    # A push's ref update (gitproxy.py): object ids before and after.
+    "old_sha": re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}"),
+    "new_sha": re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}"),
     "encoding": re.compile(r"utf-8|base64"),
 }
 # Pre-registered OAuth client ids (configuration, not callers): set by the

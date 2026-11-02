@@ -77,6 +77,13 @@ rate_limit_per_minute = 120
 # CI workflow folders (.forgejo/, .gitea/, .github/) are refused unless:
 # allow_ci_paths = true
 
+# Plain git (git_access + /git/), for clients with a shell and git. Needs
+# branch_owners = true. The URL is this server's own, as clients reach it.
+# [tenants.git_access]
+# enabled = true
+# public_url = "https://alasin.example.com"
+# ttl_seconds = 900
+
 # Branch creation: "api" (default), or "webhook" when another service creates them.
 # branch_creation = "webhook"
 # [tenants.branch_webhook]
