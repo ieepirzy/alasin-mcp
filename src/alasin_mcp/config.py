@@ -494,10 +494,25 @@ def _oauth_server(raw: dict[str, Any], server: ServerConfig) -> OAuthServerConfi
             "auth.oauth public_registration lets anyone who can reach this server get a "
             f"token for the tenant; to accept that, also set {PUBLIC_REGISTRATION_ACK} = true"
         )
-    cimd = tuple(str(u) for u in raw.get("cimd_allowed_clients", ()))
+    raw_cimd = raw.get("cimd_allowed_clients", ())
+    if not isinstance(raw_cimd, list | tuple) or not all(isinstance(u, str) for u in raw_cimd):
+        raise ConfigError("auth.oauth cimd_allowed_clients must be a list of URLs")
+    cimd = tuple(raw_cimd)
     for u in cimd:
-        parsed = urlsplit(u)
-        if parsed.scheme != "https" or not parsed.hostname or not parsed.path.strip("/"):
+        try:
+            parsed = urlsplit(u)
+            host = parsed.hostname
+        except ValueError:
+            parsed, host = None, None
+        # Lower-case scheme and host exactly as claude.ai sends them: origo
+        # compares the whole string, so any other spelling never matches.
+        if (
+            parsed is None
+            or not u.startswith("https://")
+            or not host
+            or parsed.netloc != parsed.netloc.lower()
+            or not parsed.path.strip("/")
+        ):
             raise ConfigError(
                 f"auth.oauth cimd_allowed_clients: {u!r} is not an exact https client_id URL"
             )
@@ -512,6 +527,14 @@ def _oauth_server(raw: dict[str, Any], server: ServerConfig) -> OAuthServerConfi
         )
     client_ttl = raw.get("client_ttl_seconds")
     idp = _identity_provider(raw["identity_provider"]) if "identity_provider" in raw else None
+    if cimd and idp is None and raw.get(PUBLIC_REGISTRATION_ACK) is not True:
+        # Without an IdP nobody signs in a person: every account on a listed
+        # platform could get a token for the tenant.
+        raise ConfigError(
+            "auth.oauth cimd_allowed_clients without identity_provider lets anyone with an "
+            "account on the listed platform get a token for the tenant; add identity_provider, "
+            f"or also set {PUBLIC_REGISTRATION_ACK} = true"
+        )
     if idp is not None and public:
         raise ConfigError(
             "auth.oauth: public_registration can't be combined with identity_provider; "

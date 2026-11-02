@@ -23,6 +23,7 @@ import pytest
 from alasin_mcp.app import build_app, from_config
 from alasin_mcp.auth import Principal, StaticTokenVerifier
 from alasin_mcp.config import (
+    PUBLIC_REGISTRATION_ACK,
     AuthorSource,
     ConfigError,
     IdentityProviderConfig,
@@ -663,7 +664,15 @@ def test_cimd_allowlist_config() -> None:
     cfg = parse({**BASE, "auth": auth})
     assert cfg.oauth is not None and cfg.oauth.cimd_allowed_clients == (CLAUDE,)
     assert not cfg.oauth.public_registration and not cfg.oauth.clients
-    for bad in ("claude.ai", "http://claude.ai/x", "https://claude.ai", "https:///x"):
+    for bad in (
+        "claude.ai",
+        "http://claude.ai/x",
+        "https://claude.ai",
+        "https:///x",
+        "HTTPS://claude.ai/x",
+        "https://Claude.ai/x",
+        "https://[::1/x",
+    ):
         with pytest.raises(ConfigError, match="cimd_allowed_clients"):
             parse({**BASE, "auth": _auth(cimd_allowed_clients=[bad])})
     both = _auth(
@@ -673,6 +682,16 @@ def test_cimd_allowlist_config() -> None:
     )
     with pytest.raises(ConfigError, match="exclude each other"):
         parse({**BASE, "auth": both})
+    with pytest.raises(ConfigError, match="list of URLs"):
+        parse({**BASE, "auth": _auth(cimd_allowed_clients=CLAUDE)})
+
+
+def test_cimd_allowlist_without_an_idp_needs_the_acknowledgement() -> None:
+    oauth = {"tenant": "t", "cimd_allowed_clients": [CLAUDE]}
+    with pytest.raises(ConfigError, match=PUBLIC_REGISTRATION_ACK):
+        parse({**BASE, "auth": {"oauth": oauth}})
+    cfg = parse({**BASE, "auth": {"oauth": {**oauth, PUBLIC_REGISTRATION_ACK: True}}})
+    assert cfg.oauth is not None and cfg.oauth.cimd_allowed_clients == (CLAUDE,)
 
 
 async def test_cimd_allowlist_admits_only_listed_clients(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -717,4 +736,4 @@ async def test_cimd_allowlist_admits_only_listed_clients(monkeypatch: pytest.Mon
             assert "unauthorized_client" not in loc
             assert fetched == [CLAUDE]  # the unlisted URL is never fetched
             reg = await h.post(f"{base}/register", json={"redirect_uris": [cb]})
-            assert reg.status_code >= 400 and reg.status_code != 500, reg.text
+            assert reg.status_code == 400 and "access_denied" in reg.text, reg.text
