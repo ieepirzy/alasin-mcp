@@ -751,10 +751,17 @@ def build_server(services: Services) -> MCPServer:
             repos: list[dict[str, Any]] = []
             async with call.client(cred) as client:
                 for name in literal:
+                    # A bad entry, or a repo gone, hidden or renamed (Forgejo
+                    # answers a rename with a redirect, not followed here),
+                    # lists nothing instead of failing the whole listing.
                     try:
                         repos.append(await client.repo(validation.repo(name)))
+                    except InvalidInput:
+                        log.warning(
+                            "tenant %s: repos entry is not owner/name; skipped", call.tenant.id
+                        )
                     except ForgejoError as e:
-                        if e.status not in (403, 404):
+                        if not (300 <= e.status < 400 or e.status in (403, 404)):
                             raise
                 if len(literal) < len(call.tenant.repos):
                     repos.extend(await client.user_repos())

@@ -268,6 +268,16 @@ async def test_author_argument_needs_opt_in(forgejo, monkeypatch) -> None:
         assert c["committer"] == "Alasin Bot <alasin-bot@example.com>"
 
 
+async def test_list_repos_skips_literals_it_cannot_get(forgejo, monkeypatch) -> None:
+    """A missing repo, a repo the bot can't see and a malformed entry list
+    nothing; they don't fail the listing."""
+    repos = ("acme/site", "acme/missing", "root/private", "acme")
+    with server(forgejo, monkeypatch, repos=repos) as (url, _, _):
+        sid = (await ok(url, "begin_change", {}))["session_id"]
+        listed = await ok(url, "list_repos", {"session_id": sid})
+        assert [r["repo"] for r in listed["repos"]] == ["acme/site"]
+
+
 async def test_tenant_a_cannot_reach_tenant_b_on_a_real_instance(forgejo, monkeypatch) -> None:
     """B's repo (root/private) exists on the same Forgejo, under B's host name and token."""
     with server(forgejo, monkeypatch) as (url, rec, _):
