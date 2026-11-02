@@ -266,7 +266,7 @@ async def test_force_push_is_left_to_forgejo(
         assert branch_head(forgejo, branch) == pushed
 
 
-def _no_cred(clone_url: str) -> str:
+def _no_cred(clone_url: str) -> tuple[str, str]:
     """The clone URL without its credential, and the credential."""
     scheme, rest = clone_url.split("://", 1)
     cred, host = rest.split("@", 1)
