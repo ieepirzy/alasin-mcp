@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -266,6 +267,68 @@ async def test_author_argument_needs_opt_in(forgejo, monkeypatch) -> None:
         c = await ok(url, "commit_files", {**base, **args})
         assert c["author"] == "Some One <some@example.com>"
         assert c["committer"] == "Alasin Bot <alasin-bot@example.com>"
+
+
+async def test_read_file_returns_large_files_in_line_windows(forgejo, monkeypatch) -> None:
+    """A file over the cap comes back in windows that reassemble it exactly;
+    each result stays under RESULT_BUDGET (claude.ai cuts at ~25k tokens)."""
+    from alasin_mcp.tools import RESULT_BUDGET
+
+    big = "".join(f"const line{i} = 'täällä {i}';\n" for i in range(5000))
+    assert len(big.encode()) > 2 * RESULT_BUDGET
+    with server(forgejo, monkeypatch) as (url, _, _):
+        sid = (await ok(url, "begin_change", {}))["session_id"]
+        base = {"session_id": sid, "repo": "acme/site"}
+        await ok(url, "create_branch", {**base, "branch": "lane/big"})
+        await ok(
+            url,
+            "commit_files",
+            {
+                **base,
+                "branch": "lane/big",
+                "message": "Add a big file",
+                "files": [{"path": "big.js", "content": big}],
+            },
+        )
+        got, start, calls = "", 1, 0
+        while start is not None:
+            f = await ok(
+                url,
+                "read_file",
+                {**base, "path": "big.js", "ref": "lane/big", "start_line": start},
+            )
+            calls += 1
+            assert len(f["content"].encode()) <= RESULT_BUDGET
+            assert f["total_lines"] == 5000 and f["start_line"] == start
+            assert f["truncated"] is (f["next_start_line"] is not None)
+            got += f["content"]
+            start = f["next_start_line"]
+        assert got == big and calls >= 3
+        # max_lines narrows the window.
+        f = await ok(
+            url,
+            "read_file",
+            {**base, "path": "big.js", "ref": "lane/big", "start_line": 10, "max_lines": 2},
+        )
+        assert f["content"] == "const line9 = 'täällä 9';\nconst line10 = 'täällä 10';\n"
+        assert (f["end_line"], f["next_start_line"], f["truncated"]) == (11, 12, True)
+        # A small file is whole and says so.
+        small = await ok(url, "read_file", {**base, "path": "index.html"})
+        assert small["truncated"] is False and small["next_start_line"] is None
+        assert await err(url, "read_file", {**base, "path": "index.html", "start_line": 99})
+
+
+async def test_whoami_needs_no_session_and_shows_the_tenant(forgejo, monkeypatch) -> None:
+    with server(forgejo, monkeypatch) as (url, _, audit):
+        me = await ok(url, "whoami", {})
+        assert me["tenant"] == "a" and me["repos"] == ["acme/site"]
+        assert me["name"] == "Jane Doe" and me["email"] == "jane@example.com"
+        assert me["groups"] is None  # this credential carries no groups claim
+        begun = await ok(url, "begin_change", {})
+        assert begun["tenant"] == "a" and begun["repos"] == ["acme/site"]
+    # Recorded without the person's name or email in clear.
+    logged = json.dumps(audit.events)
+    assert "jane@example.com" not in logged and "Jane Doe" not in logged
 
 
 async def test_list_repos_skips_literals_it_cannot_get(forgejo, monkeypatch) -> None:

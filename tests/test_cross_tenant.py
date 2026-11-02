@@ -104,6 +104,7 @@ HOSTILE_REPOS = [
 def _args_for(tool: str, session_id: str, repo: str) -> dict[str, Any]:
     base: dict[str, Any] = {"session_id": session_id, "repo": repo}
     return {
+        "whoami": {},
         "begin_change": {"intent": f"work on {repo} at https://{B_HOST}"},
         "list_repos": {"session_id": session_id},
         "list_branches": base,
@@ -290,7 +291,8 @@ def delegated_world(monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
         yield World(url, fake, services, services.audit_sink)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("tool", [t for t in TOOL_NAMES if t != "begin_change"])
+# begin_change and whoami never call Forgejo, so they need no Forgejo token.
+@pytest.mark.parametrize("tool", [t for t in TOOL_NAMES if t not in ("begin_change", "whoami")])
 async def test_tenant_a_never_uses_tenant_bs_stored_token(
     delegated_world: World, tool: str
 ) -> None:

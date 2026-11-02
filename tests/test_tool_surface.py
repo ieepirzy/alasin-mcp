@@ -20,6 +20,7 @@ from tests.harness import list_tools, serve, tenant
 pytestmark = pytest.mark.anyio
 
 EXPECTED = {
+    "whoami",
     "begin_change",
     "list_repos",
     "list_branches",
@@ -57,10 +58,10 @@ async def test_no_tool_takes_a_tenant_or_host_argument() -> None:
         assert not props & FORBIDDEN_ARGS, (tool.name, props)
 
 
-async def test_every_tool_but_begin_change_requires_a_session() -> None:
+async def test_every_tool_but_begin_change_and_whoami_requires_a_session() -> None:
     for tool in await _tools():
         required = set((tool.input_schema or {}).get("required", []))
-        if tool.name == "begin_change":
+        if tool.name in ("begin_change", "whoami"):
             assert "session_id" not in required
         else:
             assert "session_id" in required, tool.name
