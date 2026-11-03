@@ -4,6 +4,7 @@ a real Forgejo (tests/forgejo.py)."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -380,7 +381,11 @@ async def test_read_access_clones_any_branch_but_never_pushes(
         assert access["access"] == "read" and access["branch"] == "main"
         assert "git_config" not in access
         assert set(access["errors"]) == {"401", "403", "429"}
+        assert "git_access for a fresh one first" in access["errors"]["429"]
         assert any("CLAUDE.md" in s for s in access["steps"])
+        assert any(
+            "origin <branch>:<branch>" in s and "switch <branch>" in s for s in access["steps"]
+        )
         # Nothing reserved or created.
         after = httpx.get(
             f"{forgejo.url}/api/v1/repos/acme/site/branches",
@@ -405,6 +410,10 @@ async def test_read_access_clones_any_branch_but_never_pushes(
 
     tool_events = [e for e in audit.events if e.get("tool") == "git_access"]
     assert any(e.get("access") == "read" for e in tool_events)
+    # No branch asked for: no branch field, and never a digest of "".
+    empty = hashlib.sha256(b"").hexdigest()
+    assert empty not in json.dumps(audit.events)
+    assert not any("branch_sha256" in e for e in tool_events)
     assert not [e for e in audit.events if e.get("action") == "git_push"]
 
 
@@ -425,5 +434,29 @@ async def test_write_access_result_is_a_playbook(
             "propose_change",
         ):
             assert needle in steps, needle
-        assert set(access["errors"]) >= {"401", "403", "429", "rejected (non-fast-forward)"}
+        assert set(access["errors"]) >= {
+            "401",
+            "403",
+            "429",
+            "remote rejected",
+            "rejected (non-fast-forward)",
+        }
+        assert "pre-receive hook declined" in access["errors"]["remote rejected"]
+        assert "git_access for a fresh one first" in access["errors"]["429"]
+        assert "remote rejected" not in access["errors"]["403"]
         assert access["git_config"]["user.email"] == "jane@example.com"
+
+
+async def test_read_access_audits_the_requested_branch(
+    forgejo: fj.Forgejo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with server(forgejo, monkeypatch) as (url, audit, _):
+        sid = (await ok(url, "begin_change", {"intent": "look"}))["session_id"]
+        access = await ok(
+            url,
+            "git_access",
+            {"session_id": sid, "repo": "acme/site", "access": "read", "branch": "main"},
+        )
+        assert access["branch"] == "main"
+    attempts = [e for e in audit.events if e.get("action") == "git_access"]
+    assert attempts and attempts[0]["branch_sha256"] == hashlib.sha256(b"main").hexdigest()

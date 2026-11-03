@@ -429,7 +429,8 @@ class _Context:
             client_ip=services.client_ip.client_ip(request),
             session_id=grant.session_id,
             repo=grant.repo,
-            branch=grant.branch,
+            # A read-only credential has no branch: no field, not a digest of "".
+            **({"branch": grant.branch} if grant.branch else {}),
         )
 
     def _headers(self) -> dict[str, str]:

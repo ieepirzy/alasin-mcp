@@ -918,11 +918,16 @@ GIT_ERRORS: dict[str, dict[str, str]] = {
     "write": {
         "401": "The URL has expired (it lasts minutes). Call git_access again with the same "
         "branch, then git remote set-url origin <new clone_url>, and repeat the command.",
-        "403": "Refused: the branch isn't yours, the push touches another ref (main, a tag, a "
-        "new or deleted branch), or Forgejo's rules refuse a file. The message says which; "
-        "don't retry the same push.",
-        "429": "A push to this branch is already running, or too many requests: wait about "
-        "ten seconds and retry once.",
+        "remote rejected": "git prints '! [remote rejected] <ref> (<reason>)' and exits non-zero: "
+        "read the reason. This server refuses any ref but your branch (main, a tag, a new or "
+        "deleted branch); 'pre-receive hook declined' means Forgejo's rules refused a file "
+        "(for example a CI folder). Change what the reason names; don't retry the same push.",
+        "403": "The branch is no longer yours, the URL is for another repository, or git "
+        "access isn't available for it. Call git_access again for this repository and branch.",
+        "429": "Too many requests, too many failed sign-ins from a shared address, or a push to "
+        "this branch is already running. If the URL may have expired, call git_access for a "
+        "fresh one first (and git remote set-url origin <new clone_url>); then wait about ten "
+        "seconds and retry once.",
         "rejected (non-fast-forward)": "The branch moved: git fetch origin <branch>, git "
         "rebase origin/<branch>, then push again. Never force-push.",
     },
@@ -930,7 +935,9 @@ GIT_ERRORS: dict[str, dict[str, str]] = {
         "401": "The URL has expired: call git_access again, then git remote set-url origin "
         "<new clone_url>.",
         "403": "Read-only: this URL can't push. For a change, call git_access with access='write'.",
-        "429": "Too many requests: wait about ten seconds and retry once.",
+        "429": "Too many requests or too many failed sign-ins from a shared address. If the URL "
+        "may have expired, call git_access for a fresh one first (and git remote set-url origin "
+        "<new clone_url>); then wait about ten seconds and retry once.",
     },
 }
 
@@ -949,7 +956,8 @@ def git_steps(access: str, branch: str, name: str) -> list[str]:
         return [
             clone,
             rules,
-            f"Other branches: git -C {name} fetch --depth 1 origin <branch>.",
+            f"Another branch: git -C {name} fetch --depth 1 origin <branch>:<branch>, then "
+            f"git -C {name} switch <branch>.",
             "This URL never pushes: call git_access with access='write' to change code.",
         ]
     return [
@@ -1528,6 +1536,8 @@ def build_server(services: Services) -> MCPServer:
             if access == "read":
                 # Reserves and creates nothing: the credential is the repo's.
                 name = validation.branch(branch) if branch else ""
+                if name:
+                    call.audit["branch"] = name
                 async with call.client(cred) as client:
                     info = await call.repo_info(client, r)
                 canonical = canonical_repo(r, info)
@@ -1544,7 +1554,10 @@ def build_server(services: Services) -> MCPServer:
                     else:
                         check_owner(call, r, name)
                 token_branch = name
-            await call.record_attempt("git_access", branch=token_branch, access=access)
+            # The requested branch, when there is one: never a digest of "".
+            await call.record_attempt(
+                "git_access", access=access, **({"branch": name} if name else {})
+            )
             token, expires = call.services.store.put_git_token(
                 call.tenant.id,
                 call.principal.subject,
