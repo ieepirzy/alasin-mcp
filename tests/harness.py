@@ -124,6 +124,8 @@ class FakeRepo:
     commits: list[dict[str, Any]] = field(default_factory=list)
     compare: dict[str, Any] | None = None
     null_content: set[str] = field(default_factory=set)
+    # Commit sha -> its statuses, as Forgejo's combined status lists them.
+    statuses: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
 
 @dataclass
@@ -210,7 +212,15 @@ class FakeForgejo:
                     "name": name,
                     "protected": name in repo.protected,
                     "user_can_push": name not in repo.protected,
+                    "commit": {"id": "1" * 40},
                 },
+            )
+        if len(rest) == 3 and rest[0] == "commits" and rest[2] == "status":
+            entries = repo.statuses.get(rest[1], [])
+            states = {e["status"] for e in entries}
+            state = next((x for x in ("failure", "error", "pending") if x in states), "success")
+            return httpx.Response(
+                200, json={"sha": rest[1], "state": state if entries else "", "statuses": entries}
             )
         if rest == ["contents"] and request.method == "POST":
             files = repo.branches[body["branch"]]

@@ -112,6 +112,11 @@ class ForgejoClient:
             raise
         return resp.content
 
+    async def combined_status(self, r: RepoRef, sha: str) -> dict[str, Any]:
+        """A commit's combined status: an overall state and one entry per
+        context (CI jobs report here)."""
+        return await self._json("GET", f"{r.api_path}/commits/{quote(sha, safe='')}/status")
+
     async def compare(self, r: RepoRef, base: str, head: str) -> dict[str, Any]:
         basehead = quote(f"{base}...{head}", safe=".")
         return await self._json("GET", f"{r.api_path}/compare/{basehead}")

@@ -119,6 +119,8 @@ def _args_for(tool: str, session_id: str, repo: str) -> dict[str, Any]:
             "files": [{"path": "a.txt", "content": "x"}],
         },
         "git_access": {**base, "branch": "feature-x"},
+        "change_status": {**base, "branch": "main"},
+        "propose_change": {**base, "branch": "feature-x", "title": "t"},
     }[tool]
 
 
@@ -302,9 +304,12 @@ async def test_tenant_a_never_uses_tenant_bs_stored_token(
     r = await call_tool(w.url, A_CLIENT, tool, _args_for(tool, sid, "beta/secret"))
     assert r.is_error
     # A has no token of its own: it is sent to A's Forgejo to authorize.
-    # (git_access needs a service-account tenant: refused before that.)
+    # (git_access needs a service-account tenant, propose_change a proposal
+    # service: both refused before that.)
     if tool == "git_access":
         assert "git access is not enabled" in r.text
+    elif tool == "propose_change":
+        assert "proposing upstream is not enabled" in r.text
     else:
         assert f"https://{A_HOST}/login/oauth/authorize?" in r.text
     assert B_HOST not in r.text

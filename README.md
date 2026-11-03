@@ -38,6 +38,8 @@ structured result twice (text and `structuredContent`), so each copy stays under
 | `create_branch` | write | A new branch from the default branch (or `from_ref`). |
 | `commit_files` | write | One commit with several files (`POST /repos/{owner}/{repo}/contents`), each created or replaced in full. |
 | `git_access` | write | Plain git for one of your work branches (tenants with `[tenants.git_access]`): makes the branch for you when none is given (or checks you own the one named) and returns a `clone_url` with a short-lived credential in it, `expires_at`, the `git_config` to commit with (your name and email) and short instructions. See *Plain git*. |
+| `change_status` | read | Follow a branch from push to merge: its head `commit`, the `builds` reported on it (each job's `context`, `state`, `description` and log `target_url`) with an overall `build_state` (`none` and a note before any build reports), its `preview` link (tenants with `[tenants.previews]`, for branches under its prefix) and whether this commit's upload has succeeded, and its upstream `pull_request` (tenants with `[tenants.proposals]`: `state` open, closed or merged, `review`, `checks`; `available: false` with a note when the proposal service can't say). |
+| `propose_change` | write | Open an upstream pull request from your own branch (tenants with `[tenants.proposals]`): a `title` (1-200 characters) and a `body` (up to 4000). Returns the `pull_request` URL, or `proposed: false` with the service's `refused` reasons. See *Proposals*. |
 
 Not provided, by design: merging, deleting branches, files or repositories, repository
 settings, administration, webhooks and Actions secrets. File deletion and renames are
@@ -293,6 +295,26 @@ through this server may commit to it. Owners are kept in `server.state_path`.
   `state_path` on a persistent volume, or a restart leaves every open branch unwritable
   here.
 
+## Proposals
+
+Where the tenant's Forgejo is a staging copy of another forge, a separate
+service turns a work branch into a pull request there; this server only asks
+it, signed like the branch webhook (`X-Alasin-Timestamp`,
+`X-Alasin-Signature`):
+
+- `POST <proposals.url>` with `{"tenant", "repo", "branch", "title", "body"}`,
+  sent by `propose_change` for the branch's owner only. It answers **201**
+  `{"pull_request", "commit", "owner_sub"}`, **422** `{"refused": [...]}`, or
+  another status with `{"error"}`.
+- `POST <proposals.url>/status` with `{"tenant", "repo", "branch"}`, read only,
+  sent by `change_status`. It answers **200** `{"proposed": false}` or
+  `{"proposed": true, "pull_request", "number", "state", "draft", "head_sha",
+  "review", "checks"}`.
+
+The service names the branch's owner from its own records, never from the
+request. When it is down, `propose_change` fails with a message saying so,
+and `change_status` still reports the build and the preview.
+
 ## Tenant resolver
 
 ```python
@@ -375,6 +397,8 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `[tenants.branch_webhook]` | | `url`, `secret_file`/`secret_env`, `timeout_seconds` (60), `poll_interval_seconds` (2). |
 | `branch_owners` | `false` | Only a branch's creator may commit to it; see *Branch creation*. |
 | `[tenants.git_access]` | off | `enabled` (`false`), `public_url` (the server's own `https://host`, as git clients reach it), `ttl_seconds` (900; 60–3600), `max_push_bytes` (100 MiB), `requests_per_minute` (60, per person). See *Plain git*. |
+| `[tenants.proposals]` | off | `url` (the proposal service's endpoint), `secret_file`/`secret_env` (signs requests like the branch webhook), `timeout_seconds` (60). Needs `branch_owners`. See *Proposals*. |
+| `[tenants.previews]` | off | `base_url` (`https://host/path/`; a branch `<branch_prefix><slug>` is served at `<base_url><slug>/`), `branch_prefix` (`lane/`), `upload_context` (the commit status whose success means this commit is the live preview). |
 
 ## OAuth sign-in
 

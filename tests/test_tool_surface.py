@@ -30,6 +30,8 @@ EXPECTED = {
     "create_branch",
     "commit_files",
     "git_access",
+    "change_status",
+    "propose_change",
 }
 FORBIDDEN_WORDS = ("merge", "delete", "remove", "admin", "secret", "setting", "sudo", "webhook")
 FORBIDDEN_ARGS = {"tenant", "tenant_id", "base_url", "forgejo_url", "url", "host", "token"}

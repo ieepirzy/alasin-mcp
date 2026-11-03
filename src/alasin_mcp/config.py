@@ -130,6 +130,27 @@ class BranchWebhookConfig:
 
 
 @dataclass(frozen=True)
+class ProposalsConfig:
+    """Where ``propose_change`` sends a branch to become an upstream pull
+    request (proposals.py). Off unless a tenant configures it."""
+
+    url: str
+    secret: SecretRef
+    timeout_seconds: float = 60.0
+
+
+@dataclass(frozen=True)
+class PreviewsConfig:
+    """Branch previews that ``change_status`` links to: a branch named
+    ``<branch_prefix><slug>`` is served at ``<base_url><slug>/`` once the
+    build's ``upload_context`` status succeeds."""
+
+    base_url: str
+    branch_prefix: str = "lane/"
+    upload_context: str = ""
+
+
+@dataclass(frozen=True)
 class TenantConfig:
     id: str
     forgejo_url: str
@@ -160,6 +181,8 @@ class TenantConfig:
     # refused. Required for a tenant whose people sign in through an IdP.
     branch_owners: bool = False
     git_access: GitAccessConfig | None = None
+    proposals: ProposalsConfig | None = None
+    previews: PreviewsConfig | None = None
 
     @property
     def api_base(self) -> str:
@@ -339,6 +362,8 @@ def _tenant(raw: dict[str, Any]) -> TenantConfig:
         if not 0 < webhook.timeout_seconds <= 600 or webhook.poll_interval_seconds <= 0:
             raise ConfigError(f"tenant {tid}: branch_webhook timing out of range")
     git_access = _git_access(tid, raw["git_access"]) if "git_access" in raw else None
+    proposals = _proposals(tid, raw["proposals"]) if "proposals" in raw else None
+    previews = _previews(tid, raw["previews"]) if "previews" in raw else None
     creation = str(raw.get("branch_creation", "api"))
     if creation == "webhook" and webhook is None:
         raise ConfigError(f"tenant {tid}: branch_creation=webhook needs [tenants.branch_webhook]")
@@ -365,6 +390,8 @@ def _tenant(raw: dict[str, Any]) -> TenantConfig:
         branch_webhook=webhook,
         branch_owners=bool(raw.get("branch_owners", False)),
         git_access=git_access,
+        proposals=proposals,
+        previews=previews,
     )
     if mode is AuthMode.SERVICE_ACCOUNT and not tenant.service_token.configured:
         raise ConfigError(f"tenant {tid}: service_account mode needs service_token_file/_env")
@@ -375,6 +402,9 @@ def _tenant(raw: dict[str, Any]) -> TenantConfig:
         raise ConfigError(
             f"tenant {tid}: git_access needs auth_mode = service_account and branch_owners = true"
         )
+    if proposals is not None and not tenant.branch_owners:
+        # Only a branch's owner may propose it.
+        raise ConfigError(f"tenant {tid}: proposals needs branch_owners = true")
     if mode is AuthMode.USER_DELEGATED and oauth is None:
         raise ConfigError(f"tenant {tid}: user_delegated mode needs an [tenants.oauth] table")
     return tenant
@@ -682,6 +712,35 @@ def _git_access(tid: str, raw: dict[str, Any]) -> GitAccessConfig | None:
     if cfg.requests_per_minute < 1:
         raise ConfigError(f"tenant {tid}: git_access.requests_per_minute must be positive")
     return cfg
+
+
+def _proposals(tid: str, raw: dict[str, Any]) -> ProposalsConfig:
+    url = str(raw.get("url", ""))
+    if not url.startswith(("https://", "http://")):
+        raise ConfigError(f"tenant {tid}: proposals.url must be an http(s) URL")
+    cfg = ProposalsConfig(
+        url=url,
+        secret=_secret(raw, "secret"),
+        timeout_seconds=float(raw.get("timeout_seconds", 60)),
+    )
+    if not cfg.secret.configured:
+        raise ConfigError(f"tenant {tid}: proposals needs secret_file or secret_env")
+    if not 0 < cfg.timeout_seconds <= 600:
+        raise ConfigError(f"tenant {tid}: proposals.timeout_seconds out of range")
+    return cfg
+
+
+def _previews(tid: str, raw: dict[str, Any]) -> PreviewsConfig:
+    base = str(raw.get("base_url", ""))
+    parts = urlsplit(base)
+    if parts.scheme != "https" or not parts.hostname or parts.query or not base.endswith("/"):
+        raise ConfigError(f"tenant {tid}: previews.base_url must be https://host/path/")
+    prefix = str(raw.get("branch_prefix", "lane/"))
+    if not prefix:
+        raise ConfigError(f"tenant {tid}: previews.branch_prefix must not be empty")
+    return PreviewsConfig(
+        base_url=base, branch_prefix=prefix, upload_context=str(raw.get("upload_context", ""))
+    )
 
 
 def load(path: str | os.PathLike[str]) -> Config:
