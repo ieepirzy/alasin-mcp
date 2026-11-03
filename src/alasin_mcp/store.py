@@ -135,7 +135,8 @@ class WorkSession:
 
 @dataclass(frozen=True)
 class GitToken:
-    """What a git_access credential allows: one person, one repo, one branch."""
+    """What a git_access credential allows: one person, one repo, one branch
+    to push, or (``branch`` empty) reading the repository and nothing else."""
 
     tenant: str
     subject: str
@@ -144,6 +145,10 @@ class GitToken:
     branch: str
     session_id: str
     expires_at: float
+
+    @property
+    def read_only(self) -> bool:
+        return self.branch == ""
 
 
 def _token_sha256(token: str) -> str:
@@ -361,8 +366,9 @@ class Store:
         session_id: str,
         ttl: float,
     ) -> tuple[str, float]:
-        """Mint a credential for one branch; return it and when it expires.
-        The credential itself is never stored, only its SHA-256."""
+        """Mint a credential for one branch (``branch`` empty: read only);
+        return it and when it expires. The credential itself is never stored,
+        only its SHA-256."""
         token = secrets.token_urlsafe(32)
         now = time.time()
         self._q("DELETE FROM git_tokens WHERE expires_at < ?", (now,))

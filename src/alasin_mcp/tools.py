@@ -77,18 +77,31 @@ from .tenancy import TenantResolver, UnknownTenant
 from .validation import InvalidInput, RepoRef
 
 INSTRUCTIONS = """\
-Branch-and-commit access to a Forgejo instance.
+A change lane into a Forgejo mirror of GitHub repositories, for people who
+can't push to the GitHub repository themselves. A person reviews every change
+and merges it upstream.
 
-Start every piece of work with begin_change; pass the session_id it returns to
-every other tool. Read with list_repos, list_branches, list_folder, read_file
-and diff_branch. To change files: create_branch from the default branch, then
-commit_files to that branch (several files in one commit). You can't write to
-the default branch or to protected branches, and you can't merge, delete or
-change settings: a person reviews and merges your branch.
+Who should change code through it: only someone without write access to the
+GitHub repository. If you, or the person you're working for, can push to the
+GitHub repository directly (a GitHub integration, the gh CLI or git with write
+access), make the change on GitHub and don't use this server's write tools
+(git_access with access="write", create_branch, commit_files,
+propose_change): a lane change has to come back to GitHub through a pull
+request anyway. Reading through this server is fine either way.
+
+Start with begin_change and pass its session_id to every other tool. Read with
+list_repos, list_branches, list_folder, read_file and diff_branch, or clone
+with git_access(access="read").
+
+To change code, use plain git: git_access gives a work branch and a
+short-lived clone URL, and its result says exactly how to clone, commit and
+push. create_branch and commit_files do the same without git, for when no
+sandbox with git is available. You can't write to the default branch or to
+protected branches, and you can't merge, delete or change settings.
 
 After a push, change_status shows the branch's builds, its preview link and,
 once proposed, its upstream pull request. When the work is done and checked,
-propose_change opens that pull request. Check change_status again to follow
+propose_change opens that pull request; keep checking change_status to follow
 the build, the review and the merge.
 """
 
@@ -898,6 +911,60 @@ def _line_window(
 # -- the server ---------------------------------------------------------------------------
 
 
+# What git_access hands back besides the URL: the commands, in order, and
+# what this server's git answers mean, so a model in a sandbox can work the
+# repository the way a person with a checkout would.
+GIT_ERRORS: dict[str, dict[str, str]] = {
+    "write": {
+        "401": "The URL has expired (it lasts minutes). Call git_access again with the same "
+        "branch, then git remote set-url origin <new clone_url>, and repeat the command.",
+        "403": "Refused: the branch isn't yours, the push touches another ref (main, a tag, a "
+        "new or deleted branch), or Forgejo's rules refuse a file. The message says which; "
+        "don't retry the same push.",
+        "429": "A push to this branch is already running, or too many requests: wait about "
+        "ten seconds and retry once.",
+        "rejected (non-fast-forward)": "The branch moved: git fetch origin <branch>, git "
+        "rebase origin/<branch>, then push again. Never force-push.",
+    },
+    "read": {
+        "401": "The URL has expired: call git_access again, then git remote set-url origin "
+        "<new clone_url>.",
+        "403": "Read-only: this URL can't push. For a change, call git_access with access='write'.",
+        "429": "Too many requests: wait about ten seconds and retry once.",
+    },
+}
+
+
+def git_steps(access: str, branch: str, name: str) -> list[str]:
+    clone = (
+        f"git clone --depth 1 --branch {branch} <clone_url> {name}: give it a generous "
+        "timeout (several minutes) and don't interrupt it while it unpacks, even if it looks "
+        "stalled"
+    )
+    rules = (
+        f"Before changing anything, read CLAUDE.md, AGENTS.md and README.md at the root of "
+        f"{name} (whichever exist) and follow them."
+    )
+    if access == "read":
+        return [
+            clone,
+            rules,
+            f"Other branches: git -C {name} fetch --depth 1 origin <branch>.",
+            "This URL never pushes: call git_access with access='write' to change code.",
+        ]
+    return [
+        clone,
+        f"git -C {name} config user.name and user.email from git_config.",
+        rules,
+        "Edit, then commit with a message saying what changed and why.",
+        f"Before pushing: git -C {name} fetch origin {branch} and rebase onto "
+        f"origin/{branch} if it moved.",
+        f"git -C {name} push origin {branch}. Only this branch can be pushed.",
+        "After each push: change_status shows the build and, once it has uploaded, the "
+        "preview link. When the change is done and checked: propose_change.",
+    ]
+
+
 def build_server(services: Services) -> MCPServer:
     server = MCPServer(name="alasin-mcp", instructions=INSTRUCTIONS)
 
@@ -933,8 +1000,10 @@ def build_server(services: Services) -> MCPServer:
 
     @server.tool(
         description=(
-            "Start a piece of work. Returns a session_id that every other tool requires, "
-            "and the trace ID stamped into your commits. Describe the intent in a sentence."
+            "Start a piece of work in the Forgejo change lane (for people without write "
+            "access to the GitHub repository; with it, change GitHub directly). Returns a "
+            "session_id that every other tool requires, and the trace ID stamped into your "
+            "commits. Describe the intent in a sentence."
         ),
         annotations=READ_ONLY,
         structured_output=True,
@@ -1253,7 +1322,8 @@ def build_server(services: Services) -> MCPServer:
 
     @server.tool(
         description="Create a new branch, from the default branch unless from_ref is given. "
-        "Protected and default branches can't be created or written.",
+        "Protected and default branches can't be created or written. Prefer git_access when "
+        "you have git; with write access to the GitHub repository, change GitHub instead.",
         annotations=WRITE,
         structured_output=True,
     )
@@ -1308,9 +1378,10 @@ def build_server(services: Services) -> MCPServer:
         return await services.call(ctx, "create_branch", args, session_id, body)
 
     @server.tool(
-        description="Commit several files to an existing work branch in one commit. Each file "
-        "is created or replaced with the full content given. The server adds Co-Authored-By, "
-        "Trace-Id and Alasin-Session trailers.",
+        description="Commit several files to an existing work branch in one commit, for when "
+        "no sandbox with git is available (otherwise use git_access). Each file is created or "
+        "replaced with the full content given. The server adds Co-Authored-By, Trace-Id and "
+        "Alasin-Session trailers.",
         annotations=WRITE,
         structured_output=True,
     )
@@ -1430,15 +1501,21 @@ def build_server(services: Services) -> MCPServer:
         return await services.call(ctx, "commit_files", args, session_id, body)
 
     @server.tool(
-        description="Get plain git access to one of your work branches: a clone URL with a "
-        "short-lived credential in it. Use it with ordinary git in your sandbox (git clone, "
-        "commit, git push origin <branch>). Without a branch, a new one is made for you. Only "
-        "that branch can be pushed; ask again for a fresh URL once it expires.",
+        description="Plain git to a repository: a clone URL with a short-lived credential in "
+        "it, for ordinary git in your sandbox. access='write' (the default) gives one of your "
+        "work branches, made for you when branch is empty, and only that branch can be "
+        "pushed; use it only without write access to the GitHub repository (with it, change "
+        "GitHub instead). access='read' reserves nothing and can clone or fetch any branch but "
+        "never push. The result lists the exact commands and what each git error means.",
         annotations=WRITE,
         structured_output=True,
     )
     async def git_access(
-        ctx: Context, session_id: SessionId, repo: RepoArg, branch: str = ""
+        ctx: Context,
+        session_id: SessionId,
+        repo: RepoArg,
+        branch: str = "",
+        access: Literal["read", "write"] = "write",
     ) -> dict[str, Any]:
         async def body(call: Call) -> dict[str, Any]:
             assert call.session is not None
@@ -1446,44 +1523,57 @@ def build_server(services: Services) -> MCPServer:
             r = call.check_repo(repo)
             if cfg is None:
                 raise PolicyError("git access is not enabled on this server")
-            name = validation.branch(branch) if branch else new_branch_name(call.tenant)
-            call.audit["branch"] = name
+            call.audit["access"] = access
             cred = await call.credential(r)
-            async with call.client(cred) as client:
-                info = await call.repo_info(client, r)
-                await check_writable(call, client, r, name, info)
+            if access == "read":
+                # Reserves and creates nothing: the credential is the repo's.
+                name = validation.branch(branch) if branch else ""
+                async with call.client(cred) as client:
+                    info = await call.repo_info(client, r)
                 canonical = canonical_repo(r, info)
-                if await client.branch(r, name) is None:
-                    await create_owned_branch(call, client, r, canonical, name, info)
-                else:
-                    check_owner(call, r, name)
-            await call.record_attempt("git_access", branch=name)
+                token_branch = ""
+            else:
+                name = validation.branch(branch) if branch else new_branch_name(call.tenant)
+                call.audit["branch"] = name
+                async with call.client(cred) as client:
+                    info = await call.repo_info(client, r)
+                    await check_writable(call, client, r, name, info)
+                    canonical = canonical_repo(r, info)
+                    if await client.branch(r, name) is None:
+                        await create_owned_branch(call, client, r, canonical, name, info)
+                    else:
+                        check_owner(call, r, name)
+                token_branch = name
+            await call.record_attempt("git_access", branch=token_branch, access=access)
             token, expires = call.services.store.put_git_token(
                 call.tenant.id,
                 call.principal.subject,
                 call.principal.idp_subject,
                 canonical.full_name,
-                name,
+                token_branch,
                 call.session.session_id,
                 cfg.ttl_seconds,
             )
             scheme, _, host = cfg.public_url.partition("://")
             url = f"{scheme}://x-token:{token}@{host}/git/{canonical.full_name}.git"
             p = call.principal
-            return {
+            checkout = name or str(info["default_branch"])
+            result: dict[str, Any] = {
+                "access": access,
                 "clone_url": url,
-                "branch": name,
+                "branch": checkout,
                 "expires_at": int(expires),
-                "git_config": {"user.name": p.name or p.subject, "user.email": p.email or ""},
-                "instructions": (
-                    f"git clone --branch {name} <clone_url>; set user.name and user.email from "
-                    f"git_config; commit; git push origin {name}. Only {name} can be pushed. "
-                    "The URL stops working at expires_at: call git_access again for a new one "
-                    "and update it with git remote set-url origin <new clone_url>."
-                ),
+                "steps": git_steps(access, checkout, canonical.name),
+                "errors": GIT_ERRORS[access],
             }
+            if access == "write":
+                result["git_config"] = {
+                    "user.name": p.name or p.subject,
+                    "user.email": p.email or "",
+                }
+            return result
 
-        args = {"repo": repo, "branch": branch}
+        args = {"repo": repo, "branch": branch, "access": access}
         return await services.call(ctx, "git_access", args, session_id, body)
 
     @server.tool(

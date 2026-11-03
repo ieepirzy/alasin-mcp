@@ -362,3 +362,68 @@ async def test_push_rechecks_the_branch_owner(
         pushed = git(work, "push", "origin", branch, check=False)
         assert pushed.returncode != 0
         assert "no longer yours" in pushed.stderr or "403" in pushed.stderr
+
+
+async def test_read_access_clones_any_branch_but_never_pushes(
+    forgejo: fj.Forgejo, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with server(forgejo, monkeypatch) as (url, audit, store):
+        sid = (await ok(url, "begin_change", {"intent": "look around"}))["session_id"]
+        before = httpx.get(
+            f"{forgejo.url}/api/v1/repos/acme/site/branches",
+            headers={"Authorization": f"token {forgejo.admin_token}"},
+            timeout=10,
+        ).json()
+        access = await ok(
+            url, "git_access", {"session_id": sid, "repo": "acme/site", "access": "read"}
+        )
+        assert access["access"] == "read" and access["branch"] == "main"
+        assert "git_config" not in access
+        assert set(access["errors"]) == {"401", "403", "429"}
+        assert any("CLAUDE.md" in s for s in access["steps"])
+        # Nothing reserved or created.
+        after = httpx.get(
+            f"{forgejo.url}/api/v1/repos/acme/site/branches",
+            headers={"Authorization": f"token {forgejo.admin_token}"},
+            timeout=10,
+        ).json()
+        assert {b["name"] for b in after} == {b["name"] for b in before}
+
+        git(tmp_path, "clone", "--depth", "1", "--branch", "main", access["clone_url"], "ro")
+        work = tmp_path / "ro"
+        assert (work / "index.html").exists()
+        git(work, "config", "user.name", "Jane")
+        git(work, "config", "user.email", "jane@example.com")
+        git(work, "switch", "-c", "lane/sneaky")
+        (work / "index.html").write_text("<h1>nope</h1>\n")
+        git(work, "commit", "-am", "nope")
+        for target in ("lane/sneaky", "HEAD:main"):
+            push = git(work, "push", "origin", target, check=False)
+            assert push.returncode != 0
+            assert "read-only access" in push.stderr, push.stderr
+        assert branch_head(forgejo, "lane/sneaky") is None
+
+    tool_events = [e for e in audit.events if e.get("tool") == "git_access"]
+    assert any(e.get("access") == "read" for e in tool_events)
+    assert not [e for e in audit.events if e.get("action") == "git_push"]
+
+
+async def test_write_access_result_is_a_playbook(
+    forgejo: fj.Forgejo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with server(forgejo, monkeypatch) as (url, _, _):
+        sid = (await ok(url, "begin_change", {"intent": "copy edit"}))["session_id"]
+        access = await ok(url, "git_access", {"session_id": sid, "repo": "acme/site"})
+        assert access["access"] == "write"
+        steps = "\n".join(access["steps"])
+        for needle in (
+            "--depth 1",
+            access["branch"],
+            "CLAUDE.md",
+            "fetch origin",
+            "change_status",
+            "propose_change",
+        ):
+            assert needle in steps, needle
+        assert set(access["errors"]) >= {"401", "403", "429", "rejected (non-fast-forward)"}
+        assert access["git_config"]["user.email"] == "jane@example.com"
