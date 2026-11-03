@@ -7,6 +7,10 @@ An agent can read repositories, create a work branch and commit several files to
 one commit. It can't merge, delete, change settings or touch secrets: a person reviews
 and merges the branch. *Alasin* is Finnish for "anvil".
 
+It's a change lane for people who can't push to the upstream (GitHub) repository
+themselves. The server's instructions and tool descriptions tell a model that can push
+upstream to change it there instead, and to use alasin only for reading.
+
 - **Transport:** Streamable HTTP (stateless) at `/mcp`. People sign in through its OAuth
   front door (origo, with your OIDC provider upstream); it can also sit behind an OAuth
   gateway that forwards a bearer token, or verify JWTs from your identity provider.
@@ -37,7 +41,7 @@ structured result twice (text and `structuredContent`), so each copy stays under
 | `diff_branch` | read | A branch's commits and a unified diff per file against the default branch (or `base`), from the merge base. At most 100 commits (their messages within a quarter of the budget), 50 files, and diffs within the rest; `commit_count`, `files_changed` and `truncated` say what was left out. |
 | `create_branch` | write | A new branch from the default branch (or `from_ref`). |
 | `commit_files` | write | One commit with several files (`POST /repos/{owner}/{repo}/contents`), each created or replaced in full. |
-| `git_access` | write | Plain git for one of your work branches (tenants with `[tenants.git_access]`): makes the branch for you when none is given (or checks you own the one named) and returns a `clone_url` with a short-lived credential in it, `expires_at`, the `git_config` to commit with (your name and email) and short instructions. See *Plain git*. |
+| `git_access` | write | Plain git (tenants with `[tenants.git_access]`). `access="write"` (default): one of your work branches, made for you when none is given (or checked to be yours), with a `clone_url` holding a short-lived credential, `expires_at`, the `git_config` to commit with, the `steps` to run and what each git `errors` answer means. `access="read"`: reserves and creates nothing; the URL clones and fetches any branch and never pushes. See *Plain git*. |
 | `change_status` | read | Follow a branch from push to merge: its head `commit`, the `builds` reported on it (each job's `context`, `state`, `description` and log `target_url`) with an overall `build_state` (`none` and a note before any build reports), its `preview` link (tenants with `[tenants.previews]`, for branches under its prefix) and whether this commit's upload has succeeded, and its upstream `pull_request` (tenants with `[tenants.proposals]`: `state` open, closed or merged, `review`, `checks`; `available: false` with a note when the proposal service can't say). |
 | `propose_change` | write | Open an upstream pull request from your own branch (tenants with `[tenants.proposals]`): a `title` (1-200 characters) and a `body` (up to 4000). Returns the `pull_request` URL, or `proposed: false` with the service's `refused` reasons. See *Proposals*. |
 
@@ -77,6 +81,14 @@ git push origin lane/change-1a2b3c4d
   It sits in the URL's user part, so git sends it as HTTP Basic auth and it never appears
   in a request path or an access log. When it expires, call `git_access` again and
   `git remote set-url origin <new clone_url>`.
+- **Read-only access** (`access="read"`) mints a credential bound to no branch. Every
+  `git-receive-pack` route answers it 403 ("read-only access: call git_access with
+  access='write' to push") before anything reaches Forgejo.
+- **The result is a playbook.** `steps` lists the commands in order: a shallow clone with
+  a generous timeout, reading the repository's own `CLAUDE.md` / `AGENTS.md` / `README.md`
+  first, committing, fetching before a push, and then `change_status` and
+  `propose_change`. `errors` maps this server's 401, 403 and 429 answers and a rejected
+  non-fast-forward to what to do.
 - **Routes:** only git's smart HTTP under `/git/<owner>/<repo>.git/`: `info/refs`
   (exactly one `service`, `git-upload-pack` or `git-receive-pack`), `git-upload-pack`
   and `git-receive-pack`. No dumb HTTP, no LFS. The client's query string is never

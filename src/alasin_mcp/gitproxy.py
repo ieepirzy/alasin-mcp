@@ -19,6 +19,8 @@ branch: no other ref, no tag, no new branch, no deletion. A refused push is
 answered in git's own report-status format, so the client prints the reason
 (`` ! [remote rejected] ... (<reason>)``). Forgejo's branch protection still
 decides what the push may change (the lane's file patterns, force pushes).
+A read-only credential (``access="read"``, no branch) is refused every
+receive-pack route before anything is forwarded.
 
 Each push writes an audit attempt event before it is forwarded (refused if
 the audit can't be written) and an outcome event after. A clone or fetch is
@@ -323,6 +325,10 @@ class GitProxy:
 
         if cfg is None or not repo_allowed(tenant, repo.full_name):
             return PlainTextResponse("git access is not available here\n", status_code=403)
+        if grant.read_only and service == "git-receive-pack":
+            return PlainTextResponse(
+                "read-only access: call git_access with access='write' to push\n", 403
+            )
         try:
             # Per person, apart from the tool calls' own per-tenant bucket.
             self.services.limiter.check(
@@ -423,7 +429,8 @@ class _Context:
             client_ip=services.client_ip.client_ip(request),
             session_id=grant.session_id,
             repo=grant.repo,
-            branch=grant.branch,
+            # A read-only credential has no branch: no field, not a digest of "".
+            **({"branch": grant.branch} if grant.branch else {}),
         )
 
     def _headers(self) -> dict[str, str]:
