@@ -21,7 +21,7 @@ from tests.harness import FakeForgejo, FakeRepo, call_tool, fake_services, serve
 pytestmark = pytest.mark.anyio
 
 HOST = "forgejo.example.com"
-SECRET = "proposal-test-secret"
+SECRET = "proposal-test-secret-0123456789abcdef"
 SHA = "1" * 40
 JANE = Principal("t", "jane", "Jane Doe", "jane@example.com", email_verified=True)
 BOB = Principal("t", "bob", "Bob Roe", "bob@example.com", email_verified=True)
@@ -46,17 +46,28 @@ class Principals:
 class FakeProposer:
     """The proposal service: checks the signature like forgejo_lane.py."""
 
-    def __init__(self, status: Any = None, propose: tuple[int, Any] = (201, None), down=False):
-        self.status, self.propose, self.down = status, propose, down
+    def __init__(
+        self,
+        status: Any = None,
+        propose: tuple[int, Any] = (201, None),
+        down: bool = False,
+        lost: bool = False,
+    ):
+        self.status, self.propose, self.down, self.lost = status, propose, down, lost
         self.received: list[tuple[str, dict[str, Any]]] = []
+        self.nonces: list[Any] = []
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         if self.down:
             raise httpx.ConnectError("refused", request=request)
+        if self.lost:
+            # Sent, then the connection dropped before the answer.
+            raise httpx.ReadError("connection reset", request=request)
         ts = request.headers["x-alasin-timestamp"]
         if request.headers["x-alasin-signature"] != sign(SECRET, ts, request.content):
             return httpx.Response(401, json={})
         body = json.loads(request.content)
+        self.nonces.append(body.pop("nonce", None))
         self.received.append((request.url.path, body))
         if request.url.path.endswith("/status"):
             return httpx.Response(200, json=self.status or {"proposed": False})
@@ -230,6 +241,7 @@ async def test_owner_proposes_their_branch() -> None:
         assert not r.is_error, r.text
         assert r.data == {
             "proposed": True,
+            "created": True,
             "pull_request": PR["pull_request"],
             "commit": SHA,
             "owner_sub": "kc|jane",
@@ -303,3 +315,111 @@ async def test_proposals_off_is_refused() -> None:
         branch = await _own_branch(url, sid)
         r = await call_tool(url, "jane", "propose_change", _propose_args(sid, branch))
         assert r.is_error and "not enabled" in r.text
+
+
+# -- review follow-ups (alasin-mcp#16) ----------------------------------------------
+
+
+async def test_every_request_carries_a_fresh_nonce() -> None:
+    proposer = FakeProposer()
+    for url, _ in running(_fake(), proposer):
+        await _status(url)
+        await _status(url)
+        sid = await _sid(url)
+        branch = await _own_branch(url, sid)
+        r = await call_tool(url, "jane", "propose_change", _propose_args(sid, branch))
+        assert not r.is_error, r.text
+    assert len(proposer.nonces) == 3
+    assert all(isinstance(n, str) and len(n) == 32 for n in proposer.nonces)
+    assert len(set(proposer.nonces)) == 3
+
+
+async def test_an_existing_pull_request_comes_back_not_created() -> None:
+    existing = {
+        "pull_request": PR["pull_request"],
+        "commit": SHA,
+        "owner_sub": "kc|jane",
+        "created": False,
+    }
+    for url, _ in running(_fake(), FakeProposer(propose=(200, existing))):
+        sid = await _sid(url)
+        branch = await _own_branch(url, sid)
+        r = await call_tool(url, "jane", "propose_change", _propose_args(sid, branch))
+        assert not r.is_error, r.text
+        assert r.data is not None
+        assert r.data["created"] is False and r.data["pull_request"] == PR["pull_request"]
+
+
+async def test_a_lost_answer_says_check_before_retrying() -> None:
+    for url, _ in running(_fake(), FakeProposer(lost=True)):
+        sid = await _sid(url)
+        branch = await _own_branch(url, sid)
+        r = await call_tool(url, "jane", "propose_change", _propose_args(sid, branch))
+        assert r.is_error and "may have been sent" in r.text and "change_status" in r.text
+
+
+async def test_a_missing_secret_is_a_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TEST_PROPOSALS")
+    for url, _ in running(_fake(), FakeProposer()):
+        sid = await _sid(url)
+        branch = await _own_branch(url, sid)
+        r = await call_tool(url, "jane", "propose_change", _propose_args(sid, branch))
+        assert r.is_error and "can't sign requests" in r.text
+        out = await _status(url)
+        assert out["pull_request"]["available"] is False
+        assert "can't sign requests" in out["pull_request"]["note"]
+
+
+async def test_builds_are_cleaned_capped_and_budgeted() -> None:
+    noisy = [
+        {
+            "context": f"job\x1b[31m {i}\n",
+            "status": "success",
+            "description": "d" * 1000,
+            "target_url": "http://x/" + "u" * 1000,
+        }
+        for i in range(60)
+    ]
+    for url, _ in running(_fake(noisy), FakeProposer()):
+        out = await _status(url)
+        assert out["truncated"] is True
+        assert 0 < len(out["builds"]) <= 30
+        first = out["builds"][0]
+        assert first["context"] == "job [31m 0"
+        assert len(first["description"]) == 300 and len(first["target_url"]) == 500
+        assert len(json.dumps(out["builds"])) <= 14_000
+    for url, _ in running(_fake([_st(UPLOAD, "success")]), FakeProposer()):
+        assert (await _status(url))["truncated"] is False
+
+
+def test_config_refuses_a_short_proposals_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    from alasin_mcp.config import ConfigError, parse
+
+    def cfg(secret_env: str) -> dict[str, Any]:
+        return {
+            "auth": {"static": [{"token_env": "T", "tenant": "t", "subject": "s"}]},
+            "tenants": [
+                {
+                    "id": "t",
+                    "forgejo_url": "https://forgejo.example.com",
+                    "service_token_env": "TEST_FORGEJO",
+                    "branch_owners": True,
+                    "proposals": {"url": "http://p.invalid/v1/proposals", "secret_env": secret_env},
+                }
+            ],
+        }
+
+    monkeypatch.setenv("SHORT_SECRET", "x" * 31)
+    with pytest.raises(ConfigError, match="at least 32 bytes"):
+        parse(cfg("SHORT_SECRET"))
+    monkeypatch.setenv("LONG_SECRET", "x" * 32)
+    parsed = parse(cfg("LONG_SECRET"))
+    assert parsed.tenants[0].proposals is not None
+
+
+async def test_propose_change_says_to_check_status_first() -> None:
+    from tests.harness import list_tools
+
+    for url, _ in running(_fake(), FakeProposer()):
+        tools = {t.name: t for t in await list_tools(url, "jane")}
+        assert "change_status first" in (tools["propose_change"].description or "")

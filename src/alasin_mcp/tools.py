@@ -1515,15 +1515,25 @@ def build_server(services: Services) -> MCPServer:
                 combined = await client.combined_status(r, sha) if sha else {}
             out: dict[str, Any] = {"branch": name, "commit": sha}
             statuses = [s for s in combined.get("statuses") or [] if isinstance(s, dict)]
-            out["builds"] = [
-                {
-                    "context": str(s.get("context") or "")[:200],
-                    "state": str(s.get("status") or s.get("state") or "")[:20],
-                    "description": str(s.get("description") or "")[:300],
-                    "target_url": str(s.get("target_url") or "")[:500],
+            # Text from CI jobs: single-line, bounded, and within the result budget.
+            budget = RESULT_BUDGET // 2
+            builds: list[dict[str, Any]] = []
+            truncated = len(statuses) > MAX_STATUSES
+            for s in statuses[:MAX_STATUSES]:
+                entry = {
+                    "context": proposals.clean(s.get("context") or "", 200),
+                    "state": proposals.clean(s.get("status") or s.get("state") or "", 20),
+                    "description": proposals.clean(s.get("description") or "", 300),
+                    "target_url": proposals.clean(s.get("target_url") or "", 500),
                 }
-                for s in statuses[:MAX_STATUSES]
-            ]
+                size = len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
+                if size > budget:
+                    truncated = True
+                    break
+                budget -= size
+                builds.append(entry)
+            out["builds"] = builds
+            out["truncated"] = truncated
             if out["builds"]:
                 out["build_state"] = str(combined.get("state") or "")[:20]
             else:
@@ -1578,9 +1588,12 @@ def build_server(services: Services) -> MCPServer:
     @server.tool(
         description=(
             "Propose your branch upstream: opens a pull request from it for a person to "
-            "review and merge. Only the branch's creator may propose it. Give a short "
-            "title and a body saying what changed and how it was checked. The service may "
-            "refuse a branch (for example a change to CI files) and say why."
+            "review and merge. Call change_status first: if the branch already has an open "
+            "pull request, your push has updated it and there is nothing to propose (calling "
+            "this again just returns that pull request, created: false). Only the branch's "
+            "creator may propose it. Give a short title and a body saying what changed and "
+            "how it was checked. The service may refuse a branch (for example a change to "
+            "CI files) and say why."
         ),
         annotations=WRITE,
         structured_output=True,

@@ -311,6 +311,14 @@ it, signed like the branch webhook (`X-Alasin-Timestamp`,
   `{"proposed": true, "pull_request", "number", "state", "draft", "head_sha",
   "review", "checks"}`.
 
+Every request carries a random `nonce`, so two identical requests in the
+same second are still distinct for the receiver's replay check. A branch
+that already has an open pull request gets **200** with that pull request
+and `created: false`, because the push has already updated it. If the
+answer is lost after sending, `propose_change` says to check
+`change_status` before retrying. The secret must be at least 32 bytes, and
+a shorter one is refused at load.
+
 The service names the branch's owner from its own records, never from the
 request. When it is down, `propose_change` fails with a message saying so,
 and `change_status` still reports the build and the preview.

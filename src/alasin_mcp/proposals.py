@@ -26,13 +26,14 @@ same way though it only reads (the body names the branch). **200**
 from __future__ import annotations
 
 import json
+import secrets
 import time
 from typing import Any
 
 import httpx
 
 from .branching import refusal_reason, sign
-from .config import ProposalsConfig
+from .config import ConfigError, ProposalsConfig
 
 _REASONS_MAX = 20
 _REASON_MAX = 300
@@ -42,19 +43,32 @@ class ProposalError(Exception):
     """Proposing failed. Safe to show the model."""
 
 
-def _clean(text: Any) -> str:
+def clean(text: Any, limit: int = _REASON_MAX) -> str:
+    """Single-line, printable and bounded: text from another service."""
     text = " ".join("".join(c if c.isprintable() else " " for c in str(text)).split())
-    return text[:_REASON_MAX]
+    return text[:limit]
+
+
+_clean = clean
 
 
 def _signed(cfg: ProposalsConfig, payload: dict[str, Any]) -> tuple[bytes, dict[str, str]]:
-    raw = json.dumps(payload, separators=(",", ":")).encode()
+    # A fresh nonce: the receiver refuses a repeated (timestamp, signature),
+    # so two identical requests in one second must still differ.
+    raw = json.dumps({**payload, "nonce": secrets.token_hex(16)}, separators=(",", ":")).encode()
     timestamp = str(int(time.time()))
-    # Re-read on every call, so the secret rotates without a restart.
+    try:
+        # Re-read on every call, so the secret rotates without a restart.
+        secret = cfg.secret.resolve()
+    except (ConfigError, OSError):
+        raise ProposalError(
+            "this server can't sign requests to the proposal service (its secret is missing "
+            "or empty); ask an administrator"
+        ) from None
     return raw, {
         "Content-Type": "application/json",
         "X-Alasin-Timestamp": timestamp,
-        "X-Alasin-Signature": sign(cfg.secret.resolve(), timestamp, raw),
+        "X-Alasin-Signature": sign(secret, timestamp, raw),
     }
 
 
@@ -118,27 +132,33 @@ async def propose(
         ) as http:
             resp = await http.post(cfg.url, content=raw, headers=headers)
     except (httpx.ConnectError, httpx.ConnectTimeout):
+        # Nothing was sent.
         raise ProposalError(
             "the proposal service is not running, so branches can't be proposed upstream yet; "
             "the branch is safe as it is: ask an administrator to switch the return path on"
         ) from None
-    except httpx.TimeoutException:
+    except httpx.TransportError:
+        # Sent, but the answer was lost (a read timeout, a dropped connection).
         raise ProposalError(
-            "the proposal service did not answer in time; check the branch's pull request "
-            "upstream before trying again"
+            "the proposal service did not answer; the request may have been sent, so call "
+            "change_status to see whether a pull request exists before trying again"
         ) from None
-    if resp.status_code == 201:
+    if resp.status_code in (200, 201):
+        # 201: a new pull request; 200: the branch's open one, which the push updated.
         try:
             out = resp.json()
         except ValueError:
             out = None
         if not isinstance(out, dict) or not isinstance(out.get("pull_request"), str):
-            raise ProposalError("the proposal service answered 201 without a pull request")
+            raise ProposalError(
+                f"the proposal service answered {resp.status_code} without a pull request"
+            )
         return {
             "proposed": True,
-            "pull_request": out["pull_request"],
-            "commit": str(out.get("commit") or ""),
-            "owner_sub": str(out.get("owner_sub") or ""),
+            "created": resp.status_code == 201,
+            "pull_request": clean(out["pull_request"], 500),
+            "commit": clean(out.get("commit") or "", 64),
+            "owner_sub": clean(out.get("owner_sub") or "", 300),
         }
     if resp.status_code == 422:
         try:
