@@ -83,6 +83,8 @@ _SHAPES: dict[str, re.Pattern[str]] = {
     "old_sha": re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}"),
     "new_sha": re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}"),
     "encoding": re.compile(r"utf-8|base64"),
+    # git_access's grant (tools.py).
+    "access": re.compile(r"read|write"),
 }
 # Pre-registered OAuth client ids (configuration, not callers): set by the
 # OAuth front door at start (known_client_ids).

@@ -75,3 +75,22 @@ async def test_commit_file_entries_offer_no_delete_or_rename() -> None:
     text = str(commit.input_schema)
     assert "operation" not in text
     assert "from_path" not in text
+
+
+async def test_write_paths_say_they_are_for_people_without_github_write_access() -> None:
+    """A model that can push to GitHub itself must be told up front to use
+    GitHub: the lane is for people who can't."""
+    from alasin_mcp.tools import INSTRUCTIONS
+
+    head = INSTRUCTIONS[: INSTRUCTIONS.index("Start with begin_change")]
+    assert "can't push to the GitHub repository" in head
+    assert "make the change on GitHub" in head
+    # Plain git is the change path; the file tools are the fallback.
+    assert INSTRUCTIONS.index("git_access gives a work branch") < INSTRUCTIONS.index(
+        "create_branch and commit_files do the same without git"
+    )
+    tools = {t.name: t.description or "" for t in await _tools()}
+    for name in ("begin_change", "git_access", "create_branch"):
+        assert "GitHub" in tools[name], name
+    git = next(t for t in await _tools() if t.name == "git_access")
+    assert git.input_schema["properties"]["access"]["enum"] == ["read", "write"]
