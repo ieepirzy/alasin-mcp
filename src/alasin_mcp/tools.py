@@ -17,10 +17,13 @@ In a tenant with ``branch_owners``, ``create_branch`` records the caller as
 the branch's owner and ``commit_files`` refuses a branch it has no owner for,
 or whose owner is someone else.
 
-The tool set is fixed: reads, ``create_branch``, ``commit_files`` and
-``git_access`` (a short-lived git URL for one of the caller's branches, served
-by gitproxy.py). There is no tool to merge, delete, change settings,
-administer or read secrets.
+The tool set is fixed: reads (``change_status`` among them: a branch's
+builds, preview and upstream pull request), ``create_branch``,
+``commit_files``, ``git_access`` (a short-lived git URL for one of the
+caller's branches, served by gitproxy.py) and ``propose_change`` (the
+caller's own branch to an upstream pull request, through proposals.py).
+There is no tool to merge, delete, change settings, administer or read
+secrets.
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ from opentelemetry.trace import StatusCode
 from pydantic import BaseModel, Field
 from starlette.requests import Request
 
-from . import telemetry, validation
+from . import proposals, telemetry, validation
 from .audit import AuditSink, AuditUnavailable, digest, new_event, redact, sha256_hex, who
 from .auth import PRINCIPAL_SCOPE_KEY, Principal
 from .branching import (
@@ -59,7 +62,7 @@ from .branching import (
     WebhookBranchCreator,
 )
 from .clientip import ClientIpPolicy
-from .config import AuthMode, AuthorSource, TenantConfig
+from .config import AuthMode, AuthorSource, ConfigError, TenantConfig
 from .credentials import (
     AuthorizationRequired,
     CredentialError,
@@ -82,6 +85,11 @@ and diff_branch. To change files: create_branch from the default branch, then
 commit_files to that branch (several files in one commit). You can't write to
 the default branch or to protected branches, and you can't merge, delete or
 change settings: a person reviews and merges your branch.
+
+After a push, change_status shows the branch's builds, its preview link and,
+once proposed, its upstream pull request. When the work is done and checked,
+propose_change opens that pull request. Check change_status again to follow
+the build, the review and the merge.
 """
 
 log = logging.getLogger("alasin_mcp.tools")
@@ -101,8 +109,10 @@ TOOL_NAMES = (
     "create_branch",
     "commit_files",
     "git_access",
+    "change_status",
+    "propose_change",
 )
-WRITE_TOOLS = frozenset({"create_branch", "commit_files", "git_access"})
+WRITE_TOOLS = frozenset({"create_branch", "commit_files", "git_access", "propose_change"})
 
 RESERVED_TRAILERS = ("trace-id", "alasin-session")
 # Trailers that attribute a commit to someone. The author is the verified
@@ -119,6 +129,8 @@ RESULT_BUDGET = 28_000
 MAX_DIFF_FILES = 50
 MAX_DIFF_COMMITS = 100
 MAX_FOLDER_ENTRIES = 500
+MAX_STATUSES = 30
+_PREVIEW_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 _TRAILER_LINE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*: .+$")
 _IDENTITY = re.compile(r"^\s*([^<>\r\n]+?)\s*<([^<>\s@]+@[^<>\s@]+)>\s*$")
 
@@ -245,6 +257,8 @@ class Services:
     session_ttl: float = 12 * 3600
     # Tests inject a transport; production uses the default network transport.
     transport: httpx.AsyncBaseTransport | None = None
+    # The proposal service's transport, apart from Forgejo's (tests inject it).
+    proposal_transport: httpx.AsyncBaseTransport | None = None
     branch_creators: dict[str, BranchCreator] = field(
         default_factory=lambda: {"api": ApiBranchCreator(), "webhook": WebhookBranchCreator()}
     )
@@ -352,6 +366,7 @@ class Services:
                 CredentialError,
                 AuditUnavailable,
                 BranchCreationError,
+                proposals.ProposalError,
             ) as e:
                 error, error_kind = _loggable(e), _error_kind(e)
                 raise ToolError(str(e)) from None
@@ -426,6 +441,7 @@ def _error_kind(e: BaseException) -> str:
         CredentialError: "credential",
         AuditUnavailable: "audit_unavailable",
         BranchCreationError: "branch_creation",
+        proposals.ProposalError: "proposal",
     }.get(type(e), "error")
 
 
@@ -491,7 +507,17 @@ _RESULT_KEEP = frozenset(
 # Results that name a person (whoami, commit_files) leave these out entirely:
 # a digest of an email or a name is guessable, so not even that is written.
 _RESULT_PEOPLE = frozenset(
-    {"author", "committer", "name", "email", "subject", "idp_subject", "groups", "git_config"}
+    {
+        "author",
+        "committer",
+        "name",
+        "email",
+        "subject",
+        "idp_subject",
+        "owner_sub",
+        "groups",
+        "git_config",
+    }
 )
 # Results carrying a credential (git_access's URL) leave it out entirely.
 _RESULT_SECRET = frozenset({"clone_url"})
@@ -1459,5 +1485,140 @@ def build_server(services: Services) -> MCPServer:
 
         args = {"repo": repo, "branch": branch}
         return await services.call(ctx, "git_access", args, session_id, body)
+
+    @server.tool(
+        description=(
+            "Follow a branch's change from push to merge: its head commit, the builds "
+            "reported on it (each job's state and a link to its log), its preview link "
+            "when the deployment serves branch previews, and its upstream pull request "
+            "once proposed (open, closed or merged; review; checks). Call it after a push "
+            "and again until the build has finished."
+        ),
+        annotations=READ_ONLY,
+        structured_output=True,
+    )
+    async def change_status(
+        ctx: Context, session_id: SessionId, repo: RepoArg, branch: str
+    ) -> dict[str, Any]:
+        async def body(call: Call) -> dict[str, Any]:
+            r = call.check_repo(repo)
+            name = validation.branch(branch)
+            call.audit["branch"] = name
+            cred = await call.credential(r)
+            async with call.client(cred) as client:
+                info = await call.repo_info(client, r)
+                canonical = canonical_repo(r, info)
+                found = await client.branch(r, name)
+                if found is None:
+                    raise PolicyError(f"branch '{name}' does not exist")
+                sha = str((found.get("commit") or {}).get("id") or "")
+                combined = await client.combined_status(r, sha) if sha else {}
+            out: dict[str, Any] = {"branch": name, "commit": sha}
+            statuses = [s for s in combined.get("statuses") or [] if isinstance(s, dict)]
+            out["builds"] = [
+                {
+                    "context": str(s.get("context") or "")[:200],
+                    "state": str(s.get("status") or s.get("state") or "")[:20],
+                    "description": str(s.get("description") or "")[:300],
+                    "target_url": str(s.get("target_url") or "")[:500],
+                }
+                for s in statuses[:MAX_STATUSES]
+            ]
+            if out["builds"]:
+                out["build_state"] = str(combined.get("state") or "")[:20]
+            else:
+                out["build_state"] = "none"
+                out["build_note"] = (
+                    "no build has reported on this commit yet; a build usually starts within "
+                    "a minute or two of a push, so check again shortly"
+                )
+            pv = call.tenant.previews
+            slug = None
+            if pv is not None and name.startswith(pv.branch_prefix):
+                slug = name[len(pv.branch_prefix) :]
+            if pv is not None and slug is not None and _PREVIEW_SLUG.fullmatch(slug):
+                uploaded = any(
+                    b["context"] == pv.upload_context and b["state"] == "success"
+                    for b in out["builds"]
+                )
+                out["preview"] = {
+                    "url": f"{pv.base_url}{slug}/",
+                    "uploaded_for_this_commit": uploaded,
+                    "note": (
+                        "the preview shows this commit"
+                        if uploaded
+                        else "the preview shows this commit once its upload job succeeds; "
+                        "until then the link shows an older upload of the branch or none. "
+                        "The person opens it in their own browser and signs in"
+                    ),
+                }
+            cfg = call.tenant.proposals
+            if cfg is None:
+                out["pull_request"] = {"available": False, "note": "proposals are not enabled"}
+            else:
+                try:
+                    pr = await proposals.status(
+                        cfg,
+                        call.tenant.id,
+                        canonical.full_name,
+                        name,
+                        transport=call.services.proposal_transport,
+                    )
+                    out["pull_request"] = {"available": True, **pr}
+                except (proposals.ProposalError, ConfigError) as e:
+                    out["pull_request"] = {
+                        "available": False,
+                        "note": f"the pull request state is unavailable: {e}",
+                    }
+            return out
+
+        args = {"repo": repo, "branch": branch}
+        return await services.call(ctx, "change_status", args, session_id, body)
+
+    @server.tool(
+        description=(
+            "Propose your branch upstream: opens a pull request from it for a person to "
+            "review and merge. Only the branch's creator may propose it. Give a short "
+            "title and a body saying what changed and how it was checked. The service may "
+            "refuse a branch (for example a change to CI files) and say why."
+        ),
+        annotations=WRITE,
+        structured_output=True,
+    )
+    async def propose_change(
+        ctx: Context, session_id: SessionId, repo: RepoArg, branch: str, title: str, body: str = ""
+    ) -> dict[str, Any]:
+        async def run(call: Call) -> dict[str, Any]:
+            cfg = call.tenant.proposals
+            r = call.check_repo(repo)
+            if cfg is None:
+                raise PolicyError("proposing upstream is not enabled on this server")
+            name = validation.branch(branch)
+            call.audit["branch"] = name
+            clean_title = " ".join(title.split())
+            if not clean_title or len(clean_title) > 200:
+                raise PolicyError("title must be 1-200 characters")
+            if len(body) > 4000:
+                raise PolicyError("body must be at most 4000 characters")
+            check_owner(call, r, name)
+            cred = await call.credential(r)
+            async with call.client(cred) as client:
+                info = await call.repo_info(client, r)
+                if await client.branch(r, name) is None:
+                    raise PolicyError(f"branch '{name}' does not exist")
+            canonical = canonical_repo(r, info)
+            await call.record_attempt("propose_change", branch=name)
+            return await proposals.propose(
+                cfg,
+                call.tenant.id,
+                canonical.full_name,
+                name,
+                clean_title,
+                body,
+                transport=call.services.proposal_transport,
+            )
+
+        args = {"repo": repo, "branch": branch, "title": title, "body": body}
+        return await services.call(ctx, "propose_change", args, session_id, run)
 
     return server
