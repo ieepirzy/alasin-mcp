@@ -417,6 +417,32 @@ def test_config_refuses_a_short_proposals_secret(monkeypatch: pytest.MonkeyPatch
     assert parsed.tenants[0].proposals is not None
 
 
+def test_startup_works_with_the_proposals_secret_missing(tmp_path: Any) -> None:
+    """infra mounts forgejo-lane-caller optional: a missing file must not stop
+    the server; the tools report that they can't sign instead."""
+    from alasin_mcp.config import parse
+
+    raw = {
+        "auth": {"static": [{"token_env": "T", "tenant": "t", "subject": "s"}]},
+        "tenants": [
+            {
+                "id": "t",
+                "forgejo_url": "https://forgejo.example.com",
+                "service_token_env": "TEST_FORGEJO",
+                "branch_owners": True,
+                "proposals": {
+                    "url": "http://p.invalid/v1/proposals",
+                    "secret_file": str(tmp_path / "missing" / "secret"),
+                },
+            }
+        ],
+    }
+    assert parse(raw).tenants[0].proposals is not None
+    (tmp_path / "empty").write_text("")
+    raw["tenants"][0]["proposals"]["secret_file"] = str(tmp_path / "empty")
+    assert parse(raw).tenants[0].proposals is not None
+
+
 async def test_propose_change_says_to_check_status_first() -> None:
     from tests.harness import list_tools
 

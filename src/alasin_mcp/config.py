@@ -726,12 +726,14 @@ def _proposals(tid: str, raw: dict[str, Any]) -> ProposalsConfig:
     if not cfg.secret.configured:
         raise ConfigError(f"tenant {tid}: proposals needs secret_file or secret_env")
     # The proposal service accepts only a secret of 32 bytes or more
-    # (forgejo_lane.py SignatureVerifier): refuse a shorter one here.
+    # (forgejo_lane.py SignatureVerifier): refuse a shorter one here. A missing
+    # or empty one doesn't stop startup (the Secret may be mounted optional);
+    # propose_change and change_status then say they can't sign.
     try:
         secret = cfg.secret.resolve()
-    except OSError as e:
-        raise ConfigError(f"tenant {tid}: proposals secret can't be read: {e.strerror}") from None
-    if len(secret.encode()) < 32:
+    except (OSError, ConfigError):
+        secret = None
+    if secret is not None and len(secret.encode()) < 32:
         raise ConfigError(f"tenant {tid}: proposals secret must be at least 32 bytes")
     if not 0 < cfg.timeout_seconds <= 600:
         raise ConfigError(f"tenant {tid}: proposals.timeout_seconds out of range")
