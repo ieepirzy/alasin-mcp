@@ -90,6 +90,21 @@ def server(
         yield url, rec, audit
 
 
+def forgejo_branch(forgejo: fj.Forgejo, branch: str, token: str) -> dict[str, Any]:
+    """The branch as Forgejo reports it to the token's account."""
+    r = httpx.get(
+        f"{forgejo.url}/api/v1/repos/acme/site/branches/{branch}",
+        headers={"Authorization": f"token {token}"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def forgejo_head(forgejo: fj.Forgejo, branch: str) -> str:
+    return forgejo_branch(forgejo, branch, forgejo.admin_token)["commit"]["id"]
+
+
 async def ok(url: str, tool: str, args: dict[str, Any], **kw: Any) -> dict[str, Any]:
     r = await call_tool(url, kw.pop("token", "tok-a"), tool, args, **kw)
     assert not r.is_error, r.text
@@ -202,12 +217,44 @@ async def test_writes_to_default_and_protected_branches_are_refused(forgejo, mon
             url, "commit_files", {**base, "branch": "main", "message": "m", "files": files}
         )
         assert "default branch" in text
+        before = forgejo_head(forgejo, "frozen")
         text = await err(
             url, "commit_files", {**base, "branch": "frozen", "message": "m", "files": files}
         )
-        assert "protected in Forgejo" in text
+        # Forgejo itself refuses: the frozen rule takes no pushes at all.
+        assert "403" in text, text
+        assert forgejo_head(forgejo, "frozen") == before
         posts = [p for m, p in rec.methods if m == "POST"]
-        assert posts == [], posts
+        assert all(p.endswith("/contents") for p in posts), posts
+
+
+async def test_owner_keeps_committing_to_an_existing_lane_branch(forgejo, monkeypatch) -> None:
+    """Forgejo reports user_can_push=false on a lane branch to an account off
+    the push whitelist, though it accepts that account's commits of allowed
+    paths. A second commit to the same branch has to work, or every edit
+    needs a new branch."""
+    with server(forgejo, monkeypatch) as (url, _, _a):
+        sid = (await ok(url, "begin_change", {}))["session_id"]
+        base = {"session_id": sid, "repo": "acme/site", "branch": "lane/again"}
+        await ok(url, "create_branch", base)
+        b = forgejo_branch(forgejo, "lane/again", forgejo.bot_token)
+        assert b["protected"] is True and b["user_can_push"] is False, b
+        for n in (1, 2, 3):
+            await ok(
+                url,
+                "commit_files",
+                {**base, "message": f"edit {n}", "files": [{"path": "e.txt", "content": f"{n}"}]},
+            )
+        read = {"session_id": sid, "repo": "acme/site", "path": "e.txt", "ref": "lane/again"}
+        f = await ok(url, "read_file", read)
+        assert f["content"] == "3"
+        # Disallowed paths are still Forgejo's to refuse.
+        text = await err(
+            url,
+            "commit_files",
+            {**base, "message": "m", "files": [{"path": "schema/x.sql", "content": "x"}]},
+        )
+        assert "403" in text, text
 
 
 async def test_forgejo_protected_file_patterns_are_the_real_gate(forgejo, monkeypatch) -> None:
