@@ -96,10 +96,14 @@ with git_access(access="read").
 To change code, use plain git: git_access gives a work branch and a
 short-lived clone URL, and its result says exactly how to clone, commit and
 push. create_branch and commit_files do the same without git, for when no
-sandbox with git is available. You can't write to the default branch, and you can't merge, delete or change
-settings. Keep working on your own work branch: commit and push to it again
-for each further edit rather than starting a new branch. Forgejo checks every
-push against the branch's rules and says which paths it refuses.
+sandbox with git is available. You can't write to the default branch or to
+protected branches, and you can't merge, delete or change settings.
+
+Keep working on your own work branch: commit and push to it again for each
+further edit rather than starting a new branch. Forgejo checks every commit
+and push against the branch's rules and refuses the whole change, without
+naming the file, if any file is outside what the branch allows: keep a change
+to the files you were asked to change.
 
 After a push, change_status shows the branch's builds, its preview link and,
 once proposed, its upstream pull request. When the work is done and checked,
@@ -1519,7 +1523,8 @@ def build_server(services: Services) -> MCPServer:
         description="Plain git to a repository: a clone URL with a short-lived credential in "
         "it, for ordinary git in your sandbox. access='write' (the default) gives one of your "
         "work branches, made for you when branch is empty, and only that branch can be "
-        "pushed. To keep working on a change, pass its branch again; use it only without write access to the GitHub repository (with it, change "
+        "pushed. To keep working on a change, pass its branch again. Use write access only "
+        "without write access to the GitHub repository (with it, change "
         "GitHub instead). access='read' reserves nothing and can clone or fetch any branch but "
         "never push. The result lists the exact commands and what each git error means.",
         annotations=WRITE,
