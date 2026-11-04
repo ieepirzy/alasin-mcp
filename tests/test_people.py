@@ -14,6 +14,7 @@ import os
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -737,3 +738,47 @@ async def test_cimd_allowlist_admits_only_listed_clients(monkeypatch: pytest.Mon
             assert fetched == [CLAUDE]  # the unlisted URL is never fetched
             reg = await h.post(f"{base}/register", json={"redirect_uris": [cb]})
             assert reg.status_code == 400 and "access_denied" in reg.text, reg.text
+
+
+def test_recheck_on_refresh_from_the_environment(tmp_path: Path) -> None:
+    auth = _auth()
+    del auth["oauth"]["identity_provider"]
+    key = tmp_path / "k1"
+    key.write_text("00" * 32)
+    env = {
+        **ENV,
+        "ALASIN_IDP_RECHECK_ON_REFRESH": "true",
+        "ALASIN_IDP_TOKEN_KEY_FILES": f"{key}, /etc/alasin/idp-keys/old",
+    }
+    cfg = parse({**BASE, "auth": auth}, env=env)
+    assert cfg.oauth is not None and cfg.oauth.identity_provider is not None
+    idp = cfg.oauth.identity_provider
+    assert idp.recheck_on_refresh is True
+    assert idp.token_key_files == (str(key), "/etc/alasin/idp-keys/old")
+    # Off unless asked for; on without a key refuses to start.
+    plain = parse({**BASE, "auth": auth}, env=ENV).oauth
+    assert plain is not None and plain.identity_provider is not None
+    assert plain.identity_provider.recheck_on_refresh is False
+    with pytest.raises(ConfigError, match="token_key_files"):
+        parse({**BASE, "auth": auth}, env={**ENV, "ALASIN_IDP_RECHECK_ON_REFRESH": "1"})
+    with pytest.raises(ConfigError, match="true or false"):
+        parse({**BASE, "auth": auth}, env={**ENV, "ALASIN_IDP_RECHECK_ON_REFRESH": "maybe"})
+
+
+def test_recheck_on_refresh_reaches_origo(tmp_path: Path) -> None:
+    key = tmp_path / "k1"
+    key.write_text("11" * 32)
+    cfg = _oauth_cfg(
+        identity_provider=IdentityProviderConfig(
+            issuer=ISSUER,
+            client_id="alasin",
+            client_secret=SecretRef(env="TEST_IDP_SECRET"),
+            allowed_groups=(LANE,),
+            recheck_on_refresh=True,
+            token_key_files=(str(key),),
+        ),
+        token_ttl_seconds=900,
+    )
+    provider: Any = OrigoFrontDoor(cfg, "http://127.0.0.1:1", "/mcp")._provider
+    assert provider.identity_provider.recheck_on_refresh is True
+    assert provider.identity_provider.sealer is not None
