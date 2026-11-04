@@ -96,8 +96,10 @@ with git_access(access="read").
 To change code, use plain git: git_access gives a work branch and a
 short-lived clone URL, and its result says exactly how to clone, commit and
 push. create_branch and commit_files do the same without git, for when no
-sandbox with git is available. You can't write to the default branch or to
-protected branches, and you can't merge, delete or change settings.
+sandbox with git is available. You can't write to the default branch, and you can't merge, delete or change
+settings. Keep working on your own work branch: commit and push to it again
+for each further edit rather than starting a new branch. Forgejo checks every
+push against the branch's rules and says which paths it refuses.
 
 After a push, change_status shows the branch's builds, its preview link and,
 once proposed, its upstream pull request. When the work is done and checked,
@@ -568,10 +570,11 @@ def _result_summary(result: dict[str, Any], *, owner_named: bool = False) -> dic
 async def check_writable(
     call: Call, client: ForgejoClient, repo: RepoRef, branch: str, info: dict[str, Any]
 ) -> None:
-    """Refuse writes to the default branch and to protected branches.
+    """Refuse writes to the default branch and to branches server policy protects.
 
-    Defence in depth: Forgejo's branch protection and protected file patterns
-    are the real gate. This check keeps the server from even trying.
+    Forgejo's branch protection and file patterns are the real gate, and they
+    are checked on every commit and push. This check keeps the server from
+    trying what policy never allows.
     """
     tenant = call.tenant
     default = str(info.get("default_branch") or "main")
@@ -582,12 +585,13 @@ async def check_writable(
             raise PolicyError(f"branch '{branch}' is protected by server policy ({pattern})")
     if tenant.branch_prefix and not branch.startswith(tenant.branch_prefix):
         raise PolicyError(f"branch names must start with '{tenant.branch_prefix}'")
-    # Forgejo marks every branch a protection rule matches as "protected",
-    # including work branches where pushing is allowed and only some file
-    # patterns are locked. What matters is whether this account may push.
-    existing = await client.branch(repo, branch)
-    if existing is not None and existing.get("user_can_push") is False:
-        raise PolicyError(f"branch '{branch}' is protected in Forgejo (no push allowed)")
+    # No pre-check on Forgejo's `user_can_push`: it only says whether this
+    # account is on the rule's push whitelist. A writer off the whitelist may
+    # still commit and push changes whose every path matches the rule's
+    # unprotected_file_patterns (the lane allowlist), and the branch API
+    # doesn't expose those patterns. Refusing on it refused every write to an
+    # existing lane branch, so each edit needed a new branch. Forgejo decides
+    # on the commit or push itself.
 
 
 # How long a pending reservation holds beyond the creator's own time limit
@@ -969,7 +973,9 @@ def git_steps(access: str, branch: str, name: str) -> list[str]:
         f"origin/{branch} if it moved.",
         f"git -C {name} push origin {branch}. Only this branch can be pushed.",
         "After each push: change_status shows the build and, once it has uploaded, the "
-        "preview link. When the change is done and checked: propose_change.",
+        "preview link. Further edits go to this same branch: when the URL has expired, call "
+        f"git_access with branch='{branch}' for a fresh one. When the change is done and "
+        "checked: propose_change.",
     ]
 
 
@@ -1086,7 +1092,8 @@ def build_server(services: Services) -> MCPServer:
         return await services.call(ctx, "list_repos", {}, session_id, body)
 
     @server.tool(
-        description="List a repository's branches, with whether each is protected.",
+        description="List a repository's branches, with whether a protection rule covers "
+        "each. Covered work branches still take commits of the paths their rule allows.",
         annotations=READ_ONLY,
         structured_output=True,
     )
@@ -1512,7 +1519,7 @@ def build_server(services: Services) -> MCPServer:
         description="Plain git to a repository: a clone URL with a short-lived credential in "
         "it, for ordinary git in your sandbox. access='write' (the default) gives one of your "
         "work branches, made for you when branch is empty, and only that branch can be "
-        "pushed; use it only without write access to the GitHub repository (with it, change "
+        "pushed. To keep working on a change, pass its branch again; use it only without write access to the GitHub repository (with it, change "
         "GitHub instead). access='read' reserves nothing and can clone or fetch any branch but "
         "never push. The result lists the exact commands and what each git error means.",
         annotations=WRITE,

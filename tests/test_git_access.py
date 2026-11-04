@@ -460,3 +460,45 @@ async def test_read_access_audits_the_requested_branch(
         assert access["branch"] == "main"
     attempts = [e for e in audit.events if e.get("action") == "git_access"]
     assert attempts and attempts[0]["branch_sha256"] == hashlib.sha256(b"main").hexdigest()
+
+
+async def test_git_access_again_for_the_same_branch(
+    forgejo: fj.Forgejo, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A later git_access for the caller's own existing lane branch gives a
+    fresh URL to that branch, though Forgejo reports user_can_push=false to
+    the lane account there. Someone else still gets nothing."""
+    with server(forgejo, monkeypatch) as (url, _, _s):
+        sid = (await ok(url, "begin_change", {}))["session_id"]
+        first = await ok(url, "git_access", {"session_id": sid, "repo": "acme/site"})
+        branch = first["branch"]
+        work = clone(tmp_path, first)
+        (work / "index.html").write_text("<h1>One</h1>\n")
+        git(work, "commit", "-am", "one")
+        assert git(work, "push", "origin", branch, check=False).returncode == 0
+        seen = httpx.get(
+            f"{forgejo.url}/api/v1/repos/acme/site/branches/{branch}",
+            headers={"Authorization": f"token {forgejo.bot_token}"},
+            timeout=10,
+        ).json()
+        assert seen["user_can_push"] is False, seen
+
+        again = await ok(
+            url, "git_access", {"session_id": sid, "repo": "acme/site", "branch": branch}
+        )
+        assert again["branch"] == branch
+        work2 = clone(tmp_path, again, name="work2")
+        (work2 / "index.html").write_text("<h1>Two</h1>\n")
+        git(work2, "commit", "-am", "two")
+        push = git(work2, "push", "origin", branch, check=False)
+        assert push.returncode == 0, push.stderr
+        assert branch_head(forgejo, branch) == git(work2, "rev-parse", "HEAD").stdout.strip()
+
+        bob_sid = (await ok(url, "begin_change", {}, token="tok-bob"))["session_id"]
+        r = await call_tool(
+            url,
+            "tok-bob",
+            "git_access",
+            {"session_id": bob_sid, "repo": "acme/site", "branch": branch},
+        )
+        assert r.is_error and "was not created by you" in r.text, r.text

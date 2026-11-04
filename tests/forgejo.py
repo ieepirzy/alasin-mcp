@@ -200,10 +200,17 @@ def _bootstrap(name: str, base: str, port: int) -> Forgejo:
             http.post(
                 "/repos/acme/site/branch_protections",
                 headers=h,
+                # Shaped like production's lane/** rule (infra forgejo_lane.py
+                # protection_spec): only another account is on the push
+                # whitelist, so Forgejo reports user_can_push=false to the bot,
+                # and the bot's writes land through unprotected_file_patterns.
                 json={
                     "rule_name": "lane/*",
                     "enable_push": True,
+                    "enable_push_whitelist": True,
+                    "push_whitelist_usernames": ["root"],
                     "protected_file_patterns": "schema/**;*.sql",
+                    "unprotected_file_patterns": "**",
                 },
             )
         )
