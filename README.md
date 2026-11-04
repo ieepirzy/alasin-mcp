@@ -397,8 +397,8 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `[auth.jwt]` | | `jwks_url`, `issuer`, `audience`, `algorithms`, `tenant_claim`, `subject_claim`, `name_claim`, `email_claim`, `default_tenant`. |
 | `[auth.oauth]` | | The OAuth front door; see *OAuth sign-in*. `provider` (`origo`), `tenant` (a `service_account` tenant), `base_url` (default `server.public_url`; its host must be in `server.allowed_hosts`), `public_registration` (`false`; see the warning under *OAuth sign-in*), `cimd_allowed_clients` (exact https client_id URLs, e.g. claude.ai's `https://claude.ai/oauth/mcp-oauth-client-metadata`, that sign in without a pre-registered client; `/register` stays off, works with `identity_provider`), `allow_unauthenticated_consent` (`false`; the approve-only page, without an IdP), `auto_approve` (`false`; only with the previous), `token_ttl_seconds` (3600), `refresh_token_ttl_seconds` (30 days), `client_ttl_seconds`, `storage_path` (`/var/lib/alasin/oauth.db`; `""` = memory). |
 | `[[auth.oauth.clients]]` | | `id`, `secret_file`/`secret_env`, `redirect_uris` (exact match). Read at start-up: a new secret needs a restart. |
-| `[auth.oauth.identity_provider]` | | Per-person sign-in; see *OAuth sign-in*. `issuer` (https, exactly as in the IdP's tokens), `client_id`, `client_secret_file`/`_env` (read at start-up), `allowed_groups` (required, non-empty, exactly as emitted), `groups_claim` (`groups`; a dotted path reaches nested claims), `allowed_email_domains` (`[]`), `max_grant_age_seconds` (43200). |
-| `ALASIN_IDP_ISSUER`, `ALASIN_IDP_CLIENT_ID`, `ALASIN_IDP_CLIENT_SECRET_FILE`, `ALASIN_IDP_ALLOWED_GROUPS`, `ALASIN_IDP_GROUPS_CLAIM`, `ALASIN_IDP_MAX_GRANT_AGE` (seconds) | | Environment variables that set the identity provider instead of the table above (never both; `[auth.oauth]` must still be in the file). `ALASIN_IDP_ALLOWED_GROUPS` is comma-separated. |
+| `[auth.oauth.identity_provider]` | | Per-person sign-in; see *OAuth sign-in*. `issuer` (https, exactly as in the IdP's tokens), `client_id`, `client_secret_file`/`_env` (read at start-up), `allowed_groups` (required, non-empty, exactly as emitted), `groups_claim` (`groups`; a dotted path reaches nested claims), `allowed_email_domains` (`[]`), `max_grant_age_seconds` (43200), `recheck_on_refresh` (`false`), `token_key_files` (`[]`; required with `recheck_on_refresh`: files holding 32-byte AES-256 keys, raw/hex/base64; the first seals, all open, so a key rotates by adding the new one first). |
+| `ALASIN_IDP_ISSUER`, `ALASIN_IDP_CLIENT_ID`, `ALASIN_IDP_CLIENT_SECRET_FILE`, `ALASIN_IDP_ALLOWED_GROUPS`, `ALASIN_IDP_GROUPS_CLAIM`, `ALASIN_IDP_MAX_GRANT_AGE` (seconds), `ALASIN_IDP_RECHECK_ON_REFRESH` (`true`/`false`), `ALASIN_IDP_TOKEN_KEY_FILES` | | Environment variables that set the identity provider instead of the table above (never both; `[auth.oauth]` must still be in the file). `ALASIN_IDP_ALLOWED_GROUPS` and `ALASIN_IDP_TOKEN_KEY_FILES` are comma-separated. |
 | `[[tenants]] id` | | Lowercase tenant ID. |
 | `forgejo_url` | | Base URL of the tenant's Forgejo. |
 | `auth_mode` | `service_account` | `service_account`, `user_delegated` or `platform_scoped`. |
@@ -454,12 +454,17 @@ verified it, the name and the groups. The MCP client is still one pre-registered
   token used. Reads stay open to anyone who signed in. A write also needs a name and a
   verified email on the token, and a principal from the identity provider: a credential
   that asserts its own groups can't write.
-- Groups are those of the sign-in. origo stores them with the grant, and a refresh
-  doesn't ask the IdP again: it only re-applies `allowed_groups` to the stored groups.
-  So a person removed from the group at the IdP keeps access until the grant reaches
-  `max_grant_age_seconds` and they must sign in again, plus at most one access-token
-  lifetime. Set both short: for example `max_grant_age_seconds = 3600` and
-  `token_ttl_seconds = 900`.
+- With `recheck_on_refresh = true` (recommended), every refresh first refreshes at
+  the IdP and re-applies `allowed_groups` to the fresh groups. A disabled account, an
+  ended or revoked IdP session (Keycloak: SSO Session Idle/Max, Client Session
+  Idle/Max) or a removed group ends the grant within one access-token lifetime
+  (`token_ttl_seconds`), whatever the client holds; `max_grant_age_seconds` stays an
+  outer cap. Grants from before it was turned on need one new sign-in.
+- Without it, groups are those of the sign-in: a refresh doesn't ask the IdP, so a
+  person removed at the IdP keeps access until the grant reaches
+  `max_grant_age_seconds`, plus at most one access-token lifetime. MCP clients such
+  as claude.ai don't re-sign-in silently once refresh is refused, so a short
+  `max_grant_age_seconds` means a manual reconnect that often.
 - Commits are authored by the person (their verified name and email) and committed by
   the Forgejo service account.
 - The config refuses an inconsistent tenant: it needs `author_source = "token_claims"`

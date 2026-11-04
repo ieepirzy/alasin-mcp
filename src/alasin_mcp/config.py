@@ -238,6 +238,12 @@ class IdentityProviderConfig:
     groups_claim: str = "groups"
     allowed_email_domains: tuple[str, ...] = ()
     max_grant_age_seconds: int = 12 * 3600
+    # origo's recheck_on_refresh: every refresh first refreshes at the IdP, so
+    # a disabled account, an ended IdP session or a lost group ends the grant
+    # within one access-token lifetime. Needs token_key_files (AES-256 keys
+    # sealing the IdP refresh tokens kept; the first seals, all open).
+    recheck_on_refresh: bool = False
+    token_key_files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -420,7 +426,20 @@ IDP_ENV = {
     "ALASIN_IDP_ALLOWED_GROUPS": "allowed_groups",
     "ALASIN_IDP_GROUPS_CLAIM": "groups_claim",
     "ALASIN_IDP_MAX_GRANT_AGE": "max_grant_age_seconds",
+    "ALASIN_IDP_RECHECK_ON_REFRESH": "recheck_on_refresh",
+    "ALASIN_IDP_TOKEN_KEY_FILES": "token_key_files",
 }
+
+
+def _flag(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off", ""):
+        return False
+    raise ConfigError(f"auth.oauth.identity_provider {name} must be true or false, not {value!r}")
 
 
 def _idp_from_env(env: Mapping[str, str]) -> dict[str, Any] | None:
@@ -429,7 +448,7 @@ def _idp_from_env(env: Mapping[str, str]) -> dict[str, Any] | None:
         value = env.get(name, "").strip()
         if not value:
             continue
-        if key == "allowed_groups":
+        if key in ("allowed_groups", "token_key_files"):
             raw[key] = [g.strip() for g in value.split(",") if g.strip()]
         else:
             raw[key] = value
@@ -640,7 +659,14 @@ def _identity_provider(raw: dict[str, Any]) -> IdentityProviderConfig:
         groups_claim=str(raw.get("groups_claim", "groups")),
         allowed_email_domains=tuple(str(d) for d in raw.get("allowed_email_domains", ())),
         max_grant_age_seconds=int(raw.get("max_grant_age_seconds", 12 * 3600)),
+        recheck_on_refresh=_flag(raw.get("recheck_on_refresh", False), "recheck_on_refresh"),
+        token_key_files=tuple(str(f) for f in raw.get("token_key_files", ())),
     )
+    if idp.recheck_on_refresh and not idp.token_key_files:
+        raise ConfigError(
+            "auth.oauth.identity_provider recheck_on_refresh needs token_key_files: "
+            "the IdP refresh tokens it keeps are sealed at rest"
+        )
     if not idp.client_id:
         raise ConfigError("auth.oauth.identity_provider needs client_id")
     if idp.max_grant_age_seconds <= 0:

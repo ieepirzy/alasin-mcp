@@ -188,6 +188,8 @@ def _identity_provider(cfg: IdentityProviderConfig) -> Any:
         groups_claim=cfg.groups_claim,
         allowed_email_domains=list(cfg.allowed_email_domains) or None,
         max_grant_age=cfg.max_grant_age_seconds,
+        recheck_on_refresh=cfg.recheck_on_refresh,
+        token_key_files=list(cfg.token_key_files) or None,
     )
 
 
