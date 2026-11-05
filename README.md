@@ -399,6 +399,7 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `[[auth.oauth.clients]]` | | `id`, `secret_file`/`secret_env`, `redirect_uris` (exact match). Read at start-up: a new secret needs a restart. |
 | `[auth.oauth.identity_provider]` | | Per-person sign-in; see *OAuth sign-in*. `issuer` (https, exactly as in the IdP's tokens), `client_id`, `client_secret_file`/`_env` (read at start-up), `allowed_groups` (required, non-empty, exactly as emitted), `groups_claim` (`groups`; a dotted path reaches nested claims), `allowed_email_domains` (`[]`), `max_grant_age_seconds` (43200), `recheck_on_refresh` (`false`), `token_key_files` (`[]`; required with `recheck_on_refresh`: files holding 32-byte AES-256 keys, raw/hex/base64; the first seals, all open, so a key rotates by adding the new one first). |
 | `ALASIN_IDP_ISSUER`, `ALASIN_IDP_CLIENT_ID`, `ALASIN_IDP_CLIENT_SECRET_FILE`, `ALASIN_IDP_ALLOWED_GROUPS`, `ALASIN_IDP_GROUPS_CLAIM`, `ALASIN_IDP_MAX_GRANT_AGE` (seconds), `ALASIN_IDP_RECHECK_ON_REFRESH` (`true`/`false`), `ALASIN_IDP_TOKEN_KEY_FILES` | | Environment variables that set the identity provider instead of the table above (never both; `[auth.oauth]` must still be in the file). `ALASIN_IDP_ALLOWED_GROUPS` and `ALASIN_IDP_TOKEN_KEY_FILES` are comma-separated. |
+| `ALASIN_MANAGED_SIGNIN_ISSUER`, `ALASIN_MANAGED_SIGNIN_TENANT` | (unset) | claude.ai managed authorization; see *Managed sign-in* under *OAuth sign-in*. The issuer (https) turns it on; the tenant is optional and needs the issuer. Environment only. |
 | `[[tenants]] id` | | Lowercase tenant ID. |
 | `forgejo_url` | | Base URL of the tenant's Forgejo. |
 | `auth_mode` | `service_account` | `service_account`, `user_delegated` or `platform_scoped`. |
@@ -479,6 +480,32 @@ verified it, the name and the groups. The MCP client is still one pre-registered
   only redirect URI. For Keycloak, add a *Group Membership* mapper with *Add to ID
   token* on, and write `allowed_groups` exactly as it emits them: `/name` with *Full
   group path* on, `name` with it off.
+
+**Managed sign-in (claude.ai managed authorization).** With
+`ALASIN_MANAGED_SIGNIN_ISSUER` set, origo also accepts the RFC 7523 jwt-bearer grant
+(`urn:ietf:params:oauth:grant-type:jwt-bearer`) at `/token` with an Identity Assertion
+JWT Authorization Grant (ID-JAG): claude.ai connects every member of the organization
+without a browser sign-in. Unset, `/token` refuses the grant (`unsupported_grant_type`)
+and the metadata doesn't advertise it.
+
+- `ALASIN_MANAGED_SIGNIN_ISSUER`: the *Issuer URL* claude.ai's managed-authorization
+  page shows for "Claude-issued" (`https://identity.anthropic.com/issuers/iss_...`), one
+  per organization. `ALASIN_MANAGED_SIGNIN_TENANT` (optional): the *Tenant ID* entered
+  there; the assertion's `aud_tenant` must then equal it.
+- It needs the identity provider and `cimd_allowed_clients` (only those clients may
+  present an assertion); start-up refuses it without either, a tenant without an issuer,
+  or a non-https issuer.
+- The assertion only names an email. The token is for the one enabled IdP user with that
+  verified email, with the same subject, groups and `allowed_groups` gate as an
+  interactive sign-in; no such user means `invalid_grant`. origo looks the person up with
+  the identity provider's own client (client credentials), so for Keycloak that client
+  needs **Service accounts** enabled and the realm-management role **view-users**.
+- Groups are emitted as names (origo's `group_paths=False`): the Keycloak group mapper's
+  *Full group path* must be off, as `allowed_groups` assumes.
+- No refresh token: claude.ai fetches a fresh assertion, so someone removed from the
+  organization or disabled in the IdP stops within one access-token lifetime.
+- Each exchange is audited as `action = "managed_sign_in"`, attempt then outcome, like a
+  sign-in.
 
 **Approve-only (no identity provider).** origo then signs in nobody: whoever opens the
 authorize URL can approve, and the subject is the OAuth client, `oauth:<client id>`,

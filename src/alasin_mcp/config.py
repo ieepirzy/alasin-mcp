@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -251,6 +251,25 @@ class IdentityProviderConfig:
 
 
 @dataclass(frozen=True)
+class ManagedSignInConfig:
+    """claude.ai managed authorization (origo's ManagedSignIn, ID-JAG): an
+    organization's members connect without a browser sign-in. claude.ai signs
+    a short-lived assertion naming the member's email; origo issues a token
+    for the one enabled identity-provider user with that verified email, with
+    the same subject, groups and gate as an interactive sign-in. Needs the
+    identity provider (the person is looked up there with its own client, so
+    that client needs Service accounts and realm-management view-users) and
+    cimd_allowed_clients (only those clients may present an assertion)."""
+
+    # The assertion issuer exactly as in its ``iss``: claude.ai's
+    # "Issuer URL" (https://identity.anthropic.com/issuers/iss_...), one per
+    # organization. Pinning it limits the grant to members of that one.
+    issuer: str
+    # claude.ai's "Tenant ID", matched against the assertion's aud_tenant.
+    tenant: str | None = None
+
+
+@dataclass(frozen=True)
 class OAuthServerConfig:
     """The OAuth front door MCP clients sign in through (see oauth.py)."""
 
@@ -278,6 +297,9 @@ class OAuthServerConfig:
     # SQLite file for tokens and registered clients; empty keeps them in
     # memory, so every client signs in again after a restart.
     storage_path: str = "/var/lib/alasin/oauth.db"
+    # Accept claude.ai managed-authorization assertions at /token (from
+    # ALASIN_MANAGED_SIGNIN_*). None: only interactive sign-in.
+    managed_sign_in: ManagedSignInConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -435,6 +457,27 @@ IDP_ENV = {
 }
 
 
+# Managed sign-in comes from the environment only (it names the operator's
+# claude.ai organization, set beside the identity provider's settings).
+MANAGED_SIGNIN_ISSUER_ENV = "ALASIN_MANAGED_SIGNIN_ISSUER"
+MANAGED_SIGNIN_TENANT_ENV = "ALASIN_MANAGED_SIGNIN_TENANT"
+
+
+def _managed_sign_in_from_env(env: Mapping[str, str]) -> ManagedSignInConfig | None:
+    issuer = env.get(MANAGED_SIGNIN_ISSUER_ENV, "").strip()
+    tenant = env.get(MANAGED_SIGNIN_TENANT_ENV, "").strip()
+    if not issuer:
+        if tenant:
+            raise ConfigError(
+                f"{MANAGED_SIGNIN_TENANT_ENV} is set without {MANAGED_SIGNIN_ISSUER_ENV}"
+            )
+        return None
+    parts = urlsplit(issuer)
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+        raise ConfigError(f"{MANAGED_SIGNIN_ISSUER_ENV} must be an https URL")
+    return ManagedSignInConfig(issuer=issuer, tenant=tenant or None)
+
+
 def _flag(value: Any, name: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -522,6 +565,25 @@ def parse(raw: dict[str, Any], env: Mapping[str, str] | None = None) -> Config:
             )
         auth = {**auth, "oauth": {**auth["oauth"], "identity_provider": idp_env}}
     oauth = _oauth_server(auth["oauth"], server) if "oauth" in auth else None
+    managed = _managed_sign_in_from_env(os.environ if env is None else env)
+    if managed is not None:
+        # origo refuses these too, but only once the server is being built.
+        if oauth is None:
+            raise ConfigError(
+                f"{MANAGED_SIGNIN_ISSUER_ENV} is set but there is no [auth.oauth] to sign in through"
+            )
+        if oauth.identity_provider is None:
+            raise ConfigError(
+                f"{MANAGED_SIGNIN_ISSUER_ENV} needs an identity provider "
+                "([auth.oauth.identity_provider] or ALASIN_IDP_*): the assertion names an "
+                "email, and the person is the IdP user with it"
+            )
+        if not oauth.cimd_allowed_clients:
+            raise ConfigError(
+                f"{MANAGED_SIGNIN_ISSUER_ENV} needs auth.oauth cimd_allowed_clients: only "
+                "those clients (claude.ai's) may present an assertion"
+            )
+        oauth = replace(oauth, managed_sign_in=managed)
     if not statics and jwt is None and oauth is None:
         raise ConfigError(
             "no inbound auth configured: add [[auth.static]], [auth.jwt] or [auth.oauth]"
