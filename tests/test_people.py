@@ -782,3 +782,35 @@ def test_recheck_on_refresh_reaches_origo(tmp_path: Path) -> None:
     provider: Any = OrigoFrontDoor(cfg, "http://127.0.0.1:1", "/mcp")._provider
     assert provider.identity_provider.recheck_on_refresh is True
     assert provider.identity_provider.sealer is not None
+
+
+def test_idp_scopes_from_the_environment() -> None:
+    auth = _auth()
+    del auth["oauth"]["identity_provider"]
+    env = {**ENV, "ALASIN_IDP_SCOPES": "openid profile email offline_access"}
+    cfg = parse({**BASE, "auth": auth}, env=env)
+    assert cfg.oauth is not None and cfg.oauth.identity_provider is not None
+    assert cfg.oauth.identity_provider.scopes == ("openid", "profile", "email", "offline_access")
+    # Unset keeps origo's default; a list without openid refuses to start.
+    plain = parse({**BASE, "auth": auth}, env=ENV).oauth
+    assert plain is not None and plain.identity_provider is not None
+    assert plain.identity_provider.scopes == ()
+    with pytest.raises(ConfigError, match="openid"):
+        parse({**BASE, "auth": auth}, env={**ENV, "ALASIN_IDP_SCOPES": "profile offline_access"})
+
+
+def test_idp_scopes_reach_origo() -> None:
+    def front(scopes: tuple[str, ...]) -> Any:
+        cfg = _oauth_cfg(
+            identity_provider=IdentityProviderConfig(
+                issuer=ISSUER,
+                client_id="alasin",
+                client_secret=SecretRef(env="TEST_IDP_SECRET"),
+                allowed_groups=(LANE,),
+                scopes=scopes,
+            ),
+        )
+        return OrigoFrontDoor(cfg, "http://127.0.0.1:1", "/mcp")._provider.identity_provider
+
+    assert front(("openid", "offline_access")).scopes == ["openid", "offline_access"]
+    assert front(()).scopes == ["openid", "email", "profile"]
