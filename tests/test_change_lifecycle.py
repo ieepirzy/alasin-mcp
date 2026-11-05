@@ -11,11 +11,12 @@ from typing import Any
 import httpx
 import pytest
 
+from alasin_mcp import config
 from alasin_mcp.app import build_app
 from alasin_mcp.audit import MemoryAuditSink
 from alasin_mcp.auth import Principal
 from alasin_mcp.branching import sign
-from alasin_mcp.config import PreviewsConfig, ProposalsConfig, SecretRef
+from alasin_mcp.config import ConfigError, PreviewsConfig, ProposalsConfig, SecretRef
 from tests.harness import FakeForgejo, FakeRepo, call_tool, fake_services, serve, tenant
 
 pytestmark = pytest.mark.anyio
@@ -92,7 +93,10 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def running(
-    fake: FakeForgejo, proposer: FakeProposer | None, proposals: bool = True
+    fake: FakeForgejo,
+    proposer: FakeProposer | None,
+    proposals: bool = True,
+    preview_repos: tuple[str, ...] = (),
 ) -> Iterator[tuple[str, MemoryAuditSink]]:
     t = tenant(
         "t",
@@ -106,7 +110,9 @@ def running(
         )
         if proposals
         else None,
-        previews=PreviewsConfig(base_url="https://testing.example.com/p/", upload_context=UPLOAD),
+        previews=PreviewsConfig(
+            base_url="https://testing.example.com/p/", upload_context=UPLOAD, repos=preview_repos
+        ),
     )
     sink = MemoryAuditSink()
     services = fake_services(
@@ -202,6 +208,24 @@ async def test_status_without_the_proposer_still_reports_the_build() -> None:
 async def test_only_lane_branches_get_a_preview_link() -> None:
     for url, _ in running(_fake(), FakeProposer()):
         assert "preview" not in await _status(url, "main")
+
+
+async def test_previews_are_scoped_to_the_repos_that_build_them() -> None:
+    # acme/site is listed (case-insensitively): it keeps its preview link.
+    for url, _ in running(_fake(), FakeProposer(), preview_repos=("ACME/site",)):
+        assert (await _status(url))["preview"]["url"] == "https://testing.example.com/p/hero/"
+    # Not listed: no link (lane/hero would show another repo's preview), and
+    # the note doesn't promise a build that never comes.
+    for url, _ in running(_fake(), FakeProposer(), preview_repos=("acme/www",)):
+        out = await _status(url)
+        assert "preview" not in out
+        assert out["build_state"] == "none" and "no branch builds or previews" in out["build_note"]
+    # Builds that do report are still shown.
+    for url, _ in running(
+        _fake([_st("ci / test", "success")]), FakeProposer(), preview_repos=("x/*",)
+    ):
+        out = await _status(url)
+        assert "preview" not in out and out["build_state"] == "success"
 
 
 async def test_status_of_a_missing_branch_is_an_error() -> None:
@@ -390,6 +414,18 @@ async def test_builds_are_cleaned_capped_and_budgeted() -> None:
         assert len(json.dumps(out["builds"])) <= 14_000
     for url, _ in running(_fake([_st(UPLOAD, "success")]), FakeProposer()):
         assert (await _status(url))["truncated"] is False
+
+
+@pytest.mark.parametrize("repos", ["acme/site", ["acme"], ["acme/"], [1], ["a/b/c"]])
+def test_config_refuses_bad_preview_repos(repos: Any) -> None:
+    with pytest.raises(ConfigError, match="previews.repos"):
+        config._previews("t", {"base_url": "https://x.example/p/", "repos": repos})
+
+
+def test_config_reads_preview_repos() -> None:
+    pv = config._previews("t", {"base_url": "https://x.example/p/", "repos": ["acme/site"]})
+    assert pv.repos == ("acme/site",)
+    assert config._previews("t", {"base_url": "https://x.example/p/"}).repos == ()
 
 
 def test_config_refuses_a_short_proposals_secret(monkeypatch: pytest.MonkeyPatch) -> None:
