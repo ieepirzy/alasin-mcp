@@ -23,11 +23,13 @@ dependencies = [
 [project.optional-dependencies]
 # The in-process OAuth front door ([auth.oauth] provider = "origo"). Optional:
 # deployments that authenticate with static bearers or JWTs never load it.
-# Pinned to origo main at managed sign-in (origo#149, version 0.5.0; also
-# carries the IdP re-check on refresh, origo#148) until 0.5.0 is on PyPI;
-# then back to "origo==0.5.0". A tarball URL, not git+https, so the image
-# needs no git; uv.lock records its hash.
-origo = ["origo @ https://github.com/ieepirzy/origo/archive/e835832e41dc20858e9a7ca7bdc775df28c347a5.tar.gz"]
+# Pinned to origo main at origo#151 (version 0.5.2: managed sign-in reaches
+# Keycloak's admin API at ORIGO_MANAGED_SIGNIN_DIRECTORY_URL, an in-cluster
+# address; on top of managed sign-in, origo#149, and the IdP re-check on
+# refresh, origo#148) until 0.5.2 is on PyPI; then back to "origo==0.5.2".
+# A tarball URL, not git+https, so the image needs no git; uv.lock records
+# its hash.
+origo = ["origo @ https://github.com/ieepirzy/origo/archive/4204ab2b422142bc1549ea92e70e06f9497965c0.tar.gz"]
 
 [project.scripts]
 alasin-mcp = "alasin_mcp.app:main"
