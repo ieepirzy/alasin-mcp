@@ -69,15 +69,22 @@ from .config import (
     OAUTH_SUBJECT_PREFIX,
     ConfigError,
     IdentityProviderConfig,
+    ManagedSignInConfig,
     OAuthServerConfig,
 )
 
 log = logging.getLogger("alasin_mcp")
 
-# origo's token endpoint: where a sign-in (authorization_code) or a refresh
-# turns into an access token.
+# origo's token endpoint: where a sign-in (authorization_code), a managed
+# sign-in (a claude.ai assertion, jwt-bearer) or a refresh turns into an
+# access token.
 TOKEN_PATH = "/token"  # noqa: S105 - a URL path, not a credential
-_GRANT_ACTIONS = {"authorization_code": "sign_in", "refresh_token": "token_refresh"}
+JWT_BEARER = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+_GRANT_ACTIONS = {
+    "authorization_code": "sign_in",
+    "refresh_token": "token_refresh",
+    JWT_BEARER: "managed_sign_in",
+}
 # origo's own limit on a /token form (endpoints._read_body_limited).
 _MAX_TOKEN_BODY = 1024 * 1024
 _UNAVAILABLE = {
@@ -177,6 +184,14 @@ def _basic_client_id(header: str) -> str:
     return unquote(user) if sep else ""
 
 
+def _managed_sign_in(cfg: ManagedSignInConfig) -> Any:
+    from origo import ManagedSignIn
+
+    # group_paths stays False (names): it must match the IdP's group mapper
+    # ("Full group path" off), so allowed_groups means the same in both paths.
+    return ManagedSignIn(issuer=cfg.issuer, tenant=cfg.tenant)
+
+
 def _identity_provider(cfg: IdentityProviderConfig) -> Any:
     from origo import IdentityProvider
 
@@ -230,6 +245,9 @@ class OrigoFrontDoor:
             storage_path=cfg.storage_path or None,
             identity_provider=_identity_provider(idp) if idp is not None else None,
             allow_unauthenticated_consent=cfg.allow_unauthenticated_consent,
+            managed_sign_in=(
+                _managed_sign_in(cfg.managed_sign_in) if cfg.managed_sign_in is not None else None
+            ),
         )
         self.verifier: TokenVerifier = _OrigoVerifier(
             self._provider, cfg.tenant, idp.issuer if idp is not None else None

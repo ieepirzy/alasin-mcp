@@ -68,7 +68,14 @@ _HASHED = frozenset({"branch", "from_ref", "ref", "base", "path"})
 # a forwarded address) are written only in their own narrow shape; anything
 # else becomes a digest, so nobody can lock a name or an email into the
 # bucket by sending it as a client id, a grant type or a session id.
-_GRANT_TYPES = frozenset({"authorization_code", "refresh_token", "client_credentials"})
+_GRANT_TYPES = frozenset(
+    {
+        "authorization_code",
+        "refresh_token",
+        "client_credentials",
+        "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    }
+)
 # alasin's own session ids (store.py): "ws_" + secrets.token_urlsafe(18).
 _SESSION = re.compile(r"ws_[A-Za-z0-9_-]{24}")
 _HEX_SHA = re.compile(r"[0-9a-f]{64}")
