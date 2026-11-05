@@ -248,6 +248,11 @@ class IdentityProviderConfig:
     # sealing the IdP refresh tokens kept; the first seals, all open).
     recheck_on_refresh: bool = False
     token_key_files: tuple[str, ...] = ()
+    # Scopes asked of the IdP; empty means origo's default (openid email
+    # profile). Add offline_access for a Keycloak offline session, which no
+    # browser SSO timeout ends: with recheck_on_refresh the grant then lasts
+    # until the person is disabled, loses the group or the session is revoked.
+    scopes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -432,6 +437,7 @@ IDP_ENV = {
     "ALASIN_IDP_MAX_GRANT_AGE": "max_grant_age_seconds",
     "ALASIN_IDP_RECHECK_ON_REFRESH": "recheck_on_refresh",
     "ALASIN_IDP_TOKEN_KEY_FILES": "token_key_files",
+    "ALASIN_IDP_SCOPES": "scopes",
 }
 
 
@@ -454,6 +460,8 @@ def _idp_from_env(env: Mapping[str, str]) -> dict[str, Any] | None:
             continue
         if key in ("allowed_groups", "token_key_files"):
             raw[key] = [g.strip() for g in value.split(",") if g.strip()]
+        elif key == "scopes":
+            raw[key] = value.split()
         else:
             raw[key] = value
     return raw or None
@@ -665,7 +673,10 @@ def _identity_provider(raw: dict[str, Any]) -> IdentityProviderConfig:
         max_grant_age_seconds=int(raw.get("max_grant_age_seconds", 12 * 3600)),
         recheck_on_refresh=_flag(raw.get("recheck_on_refresh", False), "recheck_on_refresh"),
         token_key_files=tuple(str(f) for f in raw.get("token_key_files", ())),
+        scopes=tuple(str(x) for x in raw.get("scopes", ())),
     )
+    if idp.scopes and "openid" not in idp.scopes:
+        raise ConfigError("auth.oauth.identity_provider scopes must include openid")
     if idp.recheck_on_refresh and not idp.token_key_files:
         raise ConfigError(
             "auth.oauth.identity_provider recheck_on_refresh needs token_key_files: "

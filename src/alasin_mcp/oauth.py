@@ -190,6 +190,7 @@ def _identity_provider(cfg: IdentityProviderConfig) -> Any:
         max_grant_age=cfg.max_grant_age_seconds,
         recheck_on_refresh=cfg.recheck_on_refresh,
         token_key_files=list(cfg.token_key_files) or None,
+        scopes=list(cfg.scopes) or None,
     )
 
 
