@@ -62,7 +62,7 @@ from .branching import (
     WebhookBranchCreator,
 )
 from .clientip import ClientIpPolicy
-from .config import AuthMode, AuthorSource, ConfigError, TenantConfig
+from .config import AuthMode, AuthorSource, ConfigError, PreviewsConfig, TenantConfig
 from .credentials import (
     AuthorizationRequired,
     CredentialError,
@@ -246,6 +246,14 @@ def is_ci_path(tenant: TenantConfig, path: str) -> bool:
 def repo_allowed(tenant: TenantConfig, full_name: str) -> bool:
     name = full_name.casefold()
     return any(fnmatch.fnmatchcase(name, pat.casefold()) for pat in tenant.repos)
+
+
+def previews_for(previews: PreviewsConfig, full_name: str) -> bool:
+    """Whether ``full_name`` builds branch previews (empty ``repos``: all)."""
+    name = full_name.casefold()
+    return not previews.repos or any(
+        fnmatch.fnmatchcase(name, pat.casefold()) for pat in previews.repos
+    )
 
 
 def owner_configured(tenant: TenantConfig, full_name: str) -> bool:
@@ -1658,6 +1666,16 @@ def build_server(services: Services) -> MCPServer:
                     "a minute or two of a push, so check again shortly"
                 )
             pv = call.tenant.previews
+            if pv is not None and not previews_for(pv, canonical.full_name):
+                # A repository that builds no previews: its slug would point
+                # at another repository's preview of the same branch name.
+                pv = None
+                if not out["builds"]:
+                    out["build_note"] = (
+                        "no build has reported on this commit; this repository has no branch "
+                        "builds or previews here, so its checks run on the upstream pull "
+                        "request once the change is proposed"
+                    )
             slug = None
             if pv is not None and name.startswith(pv.branch_prefix):
                 slug = name[len(pv.branch_prefix) :]

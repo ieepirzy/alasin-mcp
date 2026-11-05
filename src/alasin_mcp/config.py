@@ -143,11 +143,15 @@ class ProposalsConfig:
 class PreviewsConfig:
     """Branch previews that ``change_status`` links to: a branch named
     ``<branch_prefix><slug>`` is served at ``<base_url><slug>/`` once the
-    build's ``upload_context`` status succeeds."""
+    build's ``upload_context`` status succeeds. ``repos`` (owner/name glob
+    patterns, as in the tenant's ``repos``) limits previews to the
+    repositories that build them; empty means every repository of the
+    tenant."""
 
     base_url: str
     branch_prefix: str = "lane/"
     upload_context: str = ""
+    repos: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -774,8 +778,16 @@ def _previews(tid: str, raw: dict[str, Any]) -> PreviewsConfig:
     prefix = str(raw.get("branch_prefix", "lane/"))
     if not prefix:
         raise ConfigError(f"tenant {tid}: previews.branch_prefix must not be empty")
+    repos = raw.get("repos", ())
+    if not isinstance(repos, (list, tuple)) or not all(
+        isinstance(r, str) and r.count("/") == 1 and all(r.split("/")) for r in repos
+    ):
+        raise ConfigError(f"tenant {tid}: previews.repos must be a list of owner/name patterns")
     return PreviewsConfig(
-        base_url=base, branch_prefix=prefix, upload_context=str(raw.get("upload_context", ""))
+        base_url=base,
+        branch_prefix=prefix,
+        upload_context=str(raw.get("upload_context", "")),
+        repos=tuple(repos),
     )
 
 
