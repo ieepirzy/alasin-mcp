@@ -397,8 +397,8 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `[auth.jwt]` | | `jwks_url`, `issuer`, `audience`, `algorithms`, `tenant_claim`, `subject_claim`, `name_claim`, `email_claim`, `default_tenant`. |
 | `[auth.oauth]` | | The OAuth front door; see *OAuth sign-in*. `provider` (`origo`), `tenant` (a `service_account` tenant), `base_url` (default `server.public_url`; its host must be in `server.allowed_hosts`), `public_registration` (`false`; see the warning under *OAuth sign-in*), `cimd_allowed_clients` (exact https client_id URLs, e.g. claude.ai's `https://claude.ai/oauth/mcp-oauth-client-metadata`, that sign in without a pre-registered client; `/register` stays off, works with `identity_provider`), `allow_unauthenticated_consent` (`false`; the approve-only page, without an IdP), `auto_approve` (`false`; only with the previous), `token_ttl_seconds` (3600), `refresh_token_ttl_seconds` (30 days), `client_ttl_seconds`, `storage_path` (`/var/lib/alasin/oauth.db`; `""` = memory). |
 | `[[auth.oauth.clients]]` | | `id`, `secret_file`/`secret_env`, `redirect_uris` (exact match). Read at start-up: a new secret needs a restart. |
-| `[auth.oauth.identity_provider]` | | Per-person sign-in; see *OAuth sign-in*. `issuer` (https, exactly as in the IdP's tokens), `client_id`, `client_secret_file`/`_env` (read at start-up), `allowed_groups` (required, non-empty, exactly as emitted), `groups_claim` (`groups`; a dotted path reaches nested claims), `allowed_email_domains` (`[]`), `max_grant_age_seconds` (43200), `recheck_on_refresh` (`false`), `token_key_files` (`[]`; required with `recheck_on_refresh`: files holding 32-byte AES-256 keys, raw/hex/base64; the first seals, all open, so a key rotates by adding the new one first). |
-| `ALASIN_IDP_ISSUER`, `ALASIN_IDP_CLIENT_ID`, `ALASIN_IDP_CLIENT_SECRET_FILE`, `ALASIN_IDP_ALLOWED_GROUPS`, `ALASIN_IDP_GROUPS_CLAIM`, `ALASIN_IDP_MAX_GRANT_AGE` (seconds), `ALASIN_IDP_RECHECK_ON_REFRESH` (`true`/`false`), `ALASIN_IDP_TOKEN_KEY_FILES` | | Environment variables that set the identity provider instead of the table above (never both; `[auth.oauth]` must still be in the file). `ALASIN_IDP_ALLOWED_GROUPS` and `ALASIN_IDP_TOKEN_KEY_FILES` are comma-separated. |
+| `[auth.oauth.identity_provider]` | | Per-person sign-in; see *OAuth sign-in*. `issuer` (https, exactly as in the IdP's tokens), `client_id`, `client_secret_file`/`_env` (read at start-up), `allowed_groups` (required, non-empty, exactly as emitted), `groups_claim` (`groups`; a dotted path reaches nested claims), `allowed_email_domains` (`[]`), `max_grant_age_seconds` (43200), `recheck_on_refresh` (`false`), `token_key_files` (`[]`; required with `recheck_on_refresh`: files holding 32-byte AES-256 keys, raw/hex/base64; the first seals, all open, so a key rotates by adding the new one first), `offline_access` (`false`; requires `recheck_on_refresh`: also asks the IdP for an offline session, see *OAuth sign-in*). |
+| `ALASIN_IDP_ISSUER`, `ALASIN_IDP_CLIENT_ID`, `ALASIN_IDP_CLIENT_SECRET_FILE`, `ALASIN_IDP_ALLOWED_GROUPS`, `ALASIN_IDP_GROUPS_CLAIM`, `ALASIN_IDP_MAX_GRANT_AGE` (seconds), `ALASIN_IDP_RECHECK_ON_REFRESH` (`true`/`false`), `ALASIN_IDP_TOKEN_KEY_FILES`, `ALASIN_IDP_OFFLINE_ACCESS` (`true`/`false`) | | Environment variables that set the identity provider instead of the table above (never both; `[auth.oauth]` must still be in the file). `ALASIN_IDP_ALLOWED_GROUPS` and `ALASIN_IDP_TOKEN_KEY_FILES` are comma-separated. |
 | `ALASIN_MANAGED_SIGNIN_ISSUER`, `ALASIN_MANAGED_SIGNIN_TENANT` | (unset) | claude.ai managed authorization; see *Managed sign-in* under *OAuth sign-in*. The issuer (https) turns it on; the tenant is optional and needs the issuer. Environment only. |
 | `[[tenants]] id` | | Lowercase tenant ID. |
 | `forgejo_url` | | Base URL of the tenant's Forgejo. |
@@ -461,6 +461,18 @@ verified it, the name and the groups. The MCP client is still one pre-registered
   Idle/Max) or a removed group ends the grant within one access-token lifetime
   (`token_ttl_seconds`), whatever the client holds; `max_grant_age_seconds` stays an
   outer cap. Grants from before it was turned on need one new sign-in.
+- With `offline_access = true` as well (it requires `recheck_on_refresh`), origo also
+  asks the IdP for the `offline_access` scope, so the IdP refresh token it keeps is an
+  offline one: the grant follows the IdP's offline session (Keycloak: Offline Session
+  Idle/Max) instead of the browser SSO session, and a person stays signed in while they
+  keep using the connector. Every refresh is still checked at the IdP, so signing out,
+  a disabled account, a removed group or a revoked offline session still ends the grant
+  within one access-token lifetime. origo's own refresh tokens rotate on every refresh,
+  so `refresh_token_ttl_seconds` is an idle limit; set it and `max_grant_age_seconds` at
+  least as long as the IdP's offline limits, or they end the grant first. At Keycloak,
+  the client needs the `offline_access` client scope (a realm default) and the person
+  the `offline_access` role (in the realm's default roles). An unreadable
+  `token_key_files` entry stops the server at start-up.
 - Without it, groups are those of the sign-in: a refresh doesn't ask the IdP, so a
   person removed at the IdP keeps access until the grant reaches
   `max_grant_age_seconds`, plus at most one access-token lifetime. MCP clients such

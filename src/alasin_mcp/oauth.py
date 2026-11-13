@@ -192,6 +192,11 @@ def _managed_sign_in(cfg: ManagedSignInConfig) -> Any:
     return ManagedSignIn(issuer=cfg.issuer, tenant=cfg.tenant)
 
 
+# origo's default scopes, written out so offline_access can be added to them:
+# commits need the verified email and the name.
+IDP_SCOPES = ("openid", "email", "profile")
+
+
 def _identity_provider(cfg: IdentityProviderConfig) -> Any:
     from origo import IdentityProvider
 
@@ -199,6 +204,10 @@ def _identity_provider(cfg: IdentityProviderConfig) -> Any:
         issuer=cfg.issuer,
         client_id=cfg.client_id,
         client_secret=cfg.client_secret.resolve(),
+        # offline_access: the IdP refresh token origo keeps (recheck_on_refresh,
+        # which the config requires with it) is an offline one, so the grant
+        # follows the IdP's offline session rather than its SSO session.
+        scopes=[*IDP_SCOPES, *(["offline_access"] if cfg.offline_access else [])],
         allowed_groups=list(cfg.allowed_groups),
         groups_claim=cfg.groups_claim,
         allowed_email_domains=list(cfg.allowed_email_domains) or None,

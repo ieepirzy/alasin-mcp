@@ -248,6 +248,12 @@ class IdentityProviderConfig:
     # sealing the IdP refresh tokens kept; the first seals, all open).
     recheck_on_refresh: bool = False
     token_key_files: tuple[str, ...] = ()
+    # Also ask the IdP for an offline session (scope offline_access; needs
+    # recheck_on_refresh): the grant then follows Keycloak's Offline Session
+    # Idle/Max instead of the browser SSO session, so a person stays signed
+    # in while they keep using the connector, and the IdP can still end it at
+    # any time (sign-out, a disabled account, a lost group, a revoked session).
+    offline_access: bool = False
 
 
 @dataclass(frozen=True)
@@ -454,6 +460,7 @@ IDP_ENV = {
     "ALASIN_IDP_MAX_GRANT_AGE": "max_grant_age_seconds",
     "ALASIN_IDP_RECHECK_ON_REFRESH": "recheck_on_refresh",
     "ALASIN_IDP_TOKEN_KEY_FILES": "token_key_files",
+    "ALASIN_IDP_OFFLINE_ACCESS": "offline_access",
 }
 
 
@@ -727,11 +734,19 @@ def _identity_provider(raw: dict[str, Any]) -> IdentityProviderConfig:
         max_grant_age_seconds=int(raw.get("max_grant_age_seconds", 12 * 3600)),
         recheck_on_refresh=_flag(raw.get("recheck_on_refresh", False), "recheck_on_refresh"),
         token_key_files=tuple(str(f) for f in raw.get("token_key_files", ())),
+        offline_access=_flag(raw.get("offline_access", False), "offline_access"),
     )
     if idp.recheck_on_refresh and not idp.token_key_files:
         raise ConfigError(
             "auth.oauth.identity_provider recheck_on_refresh needs token_key_files: "
             "the IdP refresh tokens it keeps are sealed at rest"
+        )
+    if idp.offline_access and not idp.recheck_on_refresh:
+        # Without the re-check origo never uses the IdP refresh token, so an
+        # offline session would only be a long-lived credential nobody checks.
+        raise ConfigError(
+            "auth.oauth.identity_provider offline_access needs recheck_on_refresh: "
+            "the offline session is what every refresh is checked against"
         )
     if not idp.client_id:
         raise ConfigError("auth.oauth.identity_provider needs client_id")

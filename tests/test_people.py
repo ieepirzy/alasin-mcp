@@ -782,3 +782,89 @@ def test_recheck_on_refresh_reaches_origo(tmp_path: Path) -> None:
     provider: Any = OrigoFrontDoor(cfg, "http://127.0.0.1:1", "/mcp")._provider
     assert provider.identity_provider.recheck_on_refresh is True
     assert provider.identity_provider.sealer is not None
+
+
+def test_offline_access_from_the_environment(tmp_path: Path) -> None:
+    auth = _auth()
+    del auth["oauth"]["identity_provider"]
+    key = tmp_path / "k1"
+    key.write_text("00" * 32)
+    recheck = {
+        **ENV,
+        "ALASIN_IDP_RECHECK_ON_REFRESH": "true",
+        "ALASIN_IDP_TOKEN_KEY_FILES": str(key),
+    }
+    cfg = parse({**BASE, "auth": auth}, env={**recheck, "ALASIN_IDP_OFFLINE_ACCESS": "yes"})
+    assert cfg.oauth is not None and cfg.oauth.identity_provider is not None
+    assert cfg.oauth.identity_provider.offline_access is True
+    # Off unless asked for, also with the re-check on.
+    plain = parse({**BASE, "auth": auth}, env=recheck).oauth
+    assert plain is not None and plain.identity_provider is not None
+    assert plain.identity_provider.offline_access is False
+    # Without the re-check nothing would ever use the offline session: refused.
+    with pytest.raises(ConfigError, match="offline_access needs recheck_on_refresh"):
+        parse({**BASE, "auth": auth}, env={**ENV, "ALASIN_IDP_OFFLINE_ACCESS": "true"})
+    with pytest.raises(ConfigError, match="true or false"):
+        parse({**BASE, "auth": auth}, env={**recheck, "ALASIN_IDP_OFFLINE_ACCESS": "ture"})
+
+
+def test_offline_access_in_the_file(tmp_path: Path) -> None:
+    key = tmp_path / "k1"
+    key.write_text("00" * 32)
+    idp = {**IDP, "recheck_on_refresh": True, "token_key_files": [str(key)]}
+    cfg = parse({**BASE, "auth": _auth({**idp, "offline_access": True})})
+    assert cfg.oauth is not None and cfg.oauth.identity_provider is not None
+    assert cfg.oauth.identity_provider.offline_access is True
+    with pytest.raises(ConfigError, match="offline_access needs recheck_on_refresh"):
+        parse({**BASE, "auth": _auth({**IDP, "offline_access": True})})
+
+
+def test_persistent_sign_in_reaches_origo(tmp_path: Path) -> None:
+    """By default origo asks the IdP for its usual scopes and keeps its
+    refresh tokens 30 days. With offline access the IdP is also asked for
+    offline_access, and refresh_token_ttl_seconds reaches origo."""
+    provider: Any = OrigoFrontDoor(
+        _oauth_cfg(identity_provider=_idp()), "http://127.0.0.1:1", "/mcp"
+    )._provider
+    assert provider.identity_provider.scopes == ["openid", "email", "profile"]
+    assert provider.identity_provider.recheck_on_refresh is False
+    assert provider.storage.refresh_token_ttl == 30 * 24 * 3600
+
+    key = tmp_path / "k1"
+    key.write_text("22" * 32)
+    cfg = _oauth_cfg(
+        identity_provider=IdentityProviderConfig(
+            issuer=ISSUER,
+            client_id="alasin",
+            client_secret=SecretRef(env="TEST_IDP_SECRET"),
+            allowed_groups=(LANE,),
+            recheck_on_refresh=True,
+            token_key_files=(str(key),),
+            offline_access=True,
+        ),
+        refresh_token_ttl_seconds=7776000,
+    )
+    provider = OrigoFrontDoor(cfg, "http://127.0.0.1:1", "/mcp")._provider
+    idp = provider.identity_provider
+    assert idp.scopes == ["openid", "email", "profile", "offline_access"]
+    assert idp.recheck_on_refresh is True and idp.sealer is not None
+    assert provider.storage.refresh_token_ttl == 7776000
+
+
+def test_a_missing_token_key_file_refuses_to_start(tmp_path: Path) -> None:
+    """alasin's keys are part of its deployment (the volume is not optional),
+    so an unreadable key file stops the start instead of quietly signing
+    people in without the re-check."""
+    cfg = _oauth_cfg(
+        identity_provider=IdentityProviderConfig(
+            issuer=ISSUER,
+            client_id="alasin",
+            client_secret=SecretRef(env="TEST_IDP_SECRET"),
+            allowed_groups=(LANE,),
+            recheck_on_refresh=True,
+            token_key_files=(str(tmp_path / "not-mounted"),),
+            offline_access=True,
+        ),
+    )
+    with pytest.raises(FileNotFoundError):
+        OrigoFrontDoor(cfg, "http://127.0.0.1:1", "/mcp")
