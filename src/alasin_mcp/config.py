@@ -372,6 +372,12 @@ def _tenant(raw: dict[str, Any]) -> TenantConfig:
     if committer:
         if mode is not AuthMode.SERVICE_ACCOUNT:
             raise ConfigError(f"tenant {tid}: service_committer needs auth_mode=service_account")
+        if source is AuthorSource.SERVICE_ACCOUNT:
+            # Never used: with the service account as author there is no
+            # separate committer. Refused so a missing author_source shows.
+            raise ConfigError(
+                f"tenant {tid}: service_committer needs an author_source other than service_account"
+            )
         if not validation.IDENTITY.match(committer):
             raise ConfigError(f"tenant {tid}: service_committer must be 'Name <email>'")
     oauth = None

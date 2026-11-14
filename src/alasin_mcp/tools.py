@@ -771,7 +771,7 @@ async def resolve_author(
     if author is None:
         return None, None, "service_account"
     # Forgejo copies the author into the committer unless told otherwise; the
-    # committer stays the account that actually made the change.
+    # committer stays the service account (GET /user, or service_committer).
     return author, await call.account_identity(client), str(source)
 
 

@@ -70,6 +70,9 @@ branch_prefix = ""
 # Who authors commits in service_account mode:
 #   service_account (default) | token_claims | trusted_header | tool_argument
 author_source = "service_account"
+# With another author_source: the committer, "Name <email>". Unset, it is read
+# from GET /user, which needs read:user on the service token.
+# service_committer = "Alasin Bot <alasin-bot@example.com>"
 agent_coauthor = "Claude <noreply@anthropic.com>"
 rate_limit_per_minute = 120
 # Only a branch's creator may commit to it (required with an identity provider):
