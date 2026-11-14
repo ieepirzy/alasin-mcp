@@ -144,8 +144,22 @@ class FakeForgejo:
         self.hosts: dict[str, dict[str, Any]] = {}
         self.requests: list[Recorded] = []
 
-    def add_host(self, host: str, token: str, login: str, repos: dict[str, FakeRepo]) -> None:
-        self.hosts[host] = {"token": token, "login": login, "repos": repos}
+    def add_host(
+        self,
+        host: str,
+        token: str,
+        login: str,
+        repos: dict[str, FakeRepo],
+        repo_scoped: bool = False,
+    ) -> None:
+        # repo_scoped: the token is a repo-scoped write:repository token, as
+        # infra mints for lane-mcp: Forgejo refuses the /user routes (403).
+        self.hosts[host] = {
+            "token": token,
+            "login": login,
+            "repos": repos,
+            "repo_scoped": repo_scoped,
+        }
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self._handle)
@@ -166,6 +180,13 @@ class FakeForgejo:
             return httpx.Response(404, json={"message": "not found"})
         parts = path[len(prefix) :].strip("/").split("/")
         repos: dict[str, FakeRepo] = host["repos"]
+        if parts[:1] == ["user"] and host.get("repo_scoped"):
+            return httpx.Response(
+                403,
+                json={
+                    "message": "token does not have at least one of required scope(s): [read:user]"
+                },
+            )
         if parts == ["user"]:
             return httpx.Response(
                 200, json={"login": host["login"], "full_name": "", "email": "bot@example.com"}

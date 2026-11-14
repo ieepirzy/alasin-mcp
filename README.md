@@ -227,7 +227,9 @@ Chosen per tenant with `auth_mode`.
 
 **Service-account author override.** By default the service account authors commits.
 `author_source` lets the deployer choose a trusted source for the author; the committer
-stays the service account and the audit records both:
+stays the service account (as `GET /user` reports it, or the configured
+`service_committer`, which is not checked against the token's account) and the audit
+records both:
 
 - `token_claims`: `name` and `email` from the verified inbound token (JWT verifier, or
   the OAuth front door's identity provider). The token must carry `email_verified: true`
@@ -403,11 +405,12 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `[[tenants]] id` | | Lowercase tenant ID. |
 | `forgejo_url` | | Base URL of the tenant's Forgejo. |
 | `auth_mode` | `service_account` | `service_account`, `user_delegated` or `platform_scoped`. |
-| `service_token_file` / `_env` | | The service account's Forgejo token (scopes `write:repository`, `read:user`). |
+| `service_token_file` / `_env` | | The service account's Forgejo token (scopes `write:repository`, plus `read:user` unless `service_committer` is set and every `repos` entry is a literal name: a glob lists repos through `GET /user/repos`). |
 | `repos` | `[]` | `owner/name` glob allowlist. Empty means none. |
 | `protected_branches` | `main`, `master`, `release/*`, `releases/*` | Never written by the server. |
 | `branch_prefix` | `""` | If set, work branches must start with it. |
 | `author_source`, `author_header` | `service_account` | See *Auth modes*. |
+| `service_committer` | `""` | `Name <email>`: the committer when `author_source` names someone else as the author (`service_account` mode, with an `author_source` other than `service_account`). Unset, it is read from Forgejo's `GET /user`, which needs `read:user`; set it to run on a repo-scoped `write:repository` token. |
 | `agent_coauthor` | `Claude <noreply@anthropic.com>` | The `Co-Authored-By` trailer; empty to omit. |
 | `rate_limit_per_minute` | `120` | Per tenant. |
 | `max_file_bytes`, `max_commit_files`, `max_commit_bytes` | 1 MB, 50, 5 MB | Read and commit caps. |

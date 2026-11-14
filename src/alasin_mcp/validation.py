@@ -19,6 +19,8 @@ _NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$")
 _FULL_REF = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
 _SHA = re.compile(r"^[0-9a-f]{7,64}$")
 _TENANT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+# A git identity, "Name <email>".
+IDENTITY = re.compile(r"^\s*([^<>\r\n]+?)\s*<([^<>\s@]+@[^<>\s@]+)>\s*$")
 
 MAX_PATH_LENGTH = 1024
 

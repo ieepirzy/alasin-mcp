@@ -254,6 +254,22 @@ def test_minimal_config() -> None:
     assert "main" in cfg.tenants[0].protected_branches
 
 
+def test_service_committer_config() -> None:
+    t = {**BASE["tenants"][0], "author_source": "token_claims"}
+    cfg = parse({**BASE, "tenants": [{**t, "service_committer": " Bot <bot@example.com> "}]})
+    assert cfg.tenants[0].service_committer == "Bot <bot@example.com>"
+    assert parse(BASE).tenants[0].service_committer == ""
+    for bad in ("bot@example.com", "Bot <not-an-email>", "Bot <a@b> trailing"):
+        with pytest.raises(ConfigError, match="service_committer"):
+            parse({**BASE, "tenants": [{**t, "service_committer": bad}]})
+    with pytest.raises(ConfigError, match="author_source"):
+        plain = {**BASE["tenants"][0], "service_committer": "B <b@example.com>"}
+        parse({**BASE, "tenants": [plain]})
+    with pytest.raises(ConfigError, match="service_account"):
+        delegated = {**t, "auth_mode": "user_delegated", "service_committer": "B <b@example.com>"}
+        parse({**BASE, "tenants": [delegated]})
+
+
 def test_inline_secret_refused() -> None:
     bad = {**BASE, "tenants": [{**BASE["tenants"][0], "service_token": "plain"}]}
     with pytest.raises(ConfigError):

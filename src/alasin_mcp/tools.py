@@ -151,7 +151,7 @@ MAX_FOLDER_ENTRIES = 500
 MAX_STATUSES = 30
 _PREVIEW_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 _TRAILER_LINE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*: .+$")
-_IDENTITY = re.compile(r"^\s*([^<>\r\n]+?)\s*<([^<>\s@]+@[^<>\s@]+)>\s*$")
+_IDENTITY = validation.IDENTITY
 
 SessionId = Annotated[str, Field(description="The session_id returned by begin_change.")]
 RepoArg = Annotated[str, Field(description="Repository as 'owner/name'.")]
@@ -229,6 +229,12 @@ class Call:
 
     async def account_identity(self, client: ForgejoClient) -> Identity:
         cache = self.services.cache
+        # A configured committer needs no Forgejo call: GET /user needs the
+        # read:user scope, which a repo-scoped service token does not carry.
+        if self.tenant.service_committer:
+            configured = parse_identity(self.tenant.service_committer)
+            assert configured is not None  # validated when the config loads
+            return configured
         hit = cache.get(self.principal, "identity", self.tenant.auth_mode)
         if hit is not None:
             return hit
@@ -765,7 +771,7 @@ async def resolve_author(
     if author is None:
         return None, None, "service_account"
     # Forgejo copies the author into the committer unless told otherwise; the
-    # committer stays the account that actually made the change.
+    # committer stays the service account (GET /user, or service_committer).
     return author, await call.account_identity(client), str(source)
 
 
