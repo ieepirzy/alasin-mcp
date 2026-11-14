@@ -403,11 +403,12 @@ environment variable name). See [`examples/config.toml`](examples/config.toml).
 | `[[tenants]] id` | | Lowercase tenant ID. |
 | `forgejo_url` | | Base URL of the tenant's Forgejo. |
 | `auth_mode` | `service_account` | `service_account`, `user_delegated` or `platform_scoped`. |
-| `service_token_file` / `_env` | | The service account's Forgejo token (scopes `write:repository`, `read:user`). |
+| `service_token_file` / `_env` | | The service account's Forgejo token (scopes `write:repository`, and `read:user` unless `service_committer` is set). |
 | `repos` | `[]` | `owner/name` glob allowlist. Empty means none. |
 | `protected_branches` | `main`, `master`, `release/*`, `releases/*` | Never written by the server. |
 | `branch_prefix` | `""` | If set, work branches must start with it. |
 | `author_source`, `author_header` | `service_account` | See *Auth modes*. |
+| `service_committer` | `""` | `Name <email>`: the committer when `author_source` names someone else as the author (`service_account` mode only). Unset, it is read from Forgejo's `GET /user`, which needs `read:user`; set it to run on a repo-scoped `write:repository` token. |
 | `agent_coauthor` | `Claude <noreply@anthropic.com>` | The `Co-Authored-By` trailer; empty to omit. |
 | `rate_limit_per_minute` | `120` | Per tenant. |
 | `max_file_bytes`, `max_commit_files`, `max_commit_bytes` | 1 MB, 50, 5 MB | Read and commit caps. |

@@ -548,6 +548,36 @@ async def test_token_claims_author_needs_verified_email() -> None:
         assert not res.is_error, res.text
 
 
+async def test_configured_committer_needs_no_read_user() -> None:
+    """A repo-scoped write:repository token is refused GET /user (403, no
+    read:user). With token_claims authors the committer came from /user, so
+    every commit failed in production; a configured committer skips the call."""
+    principals = {"v": Principal("t", "v", "V", "v@example.com", email_verified=True)}
+    fake = FakeForgejo()
+    fake.add_host(
+        HOST,
+        FORGEJO_TOKEN,
+        "bot",
+        {"acme/site": FakeRepo(branches={"main": {"README.md": b"hi\n"}, "work": {}})},
+        repo_scoped=True,
+    )
+    unset = fake_services(fake, [_tenant(author_source=AuthorSource.TOKEN_CLAIMS)])
+    with serve(build_app(unset, StaticPrincipals(principals))) as url:
+        res = await call_tool(url, "v", "commit_files", _commit(await _sid(url, "v")))
+        assert res.is_error and "read:user" in res.text
+    tenant = _tenant(
+        author_source=AuthorSource.TOKEN_CLAIMS, service_committer="Lane MCP <lane-mcp@example.com>"
+    )
+    fake.requests.clear()
+    with serve(build_app(fake_services(fake, [tenant]), StaticPrincipals(principals))) as url:
+        res = await call_tool(url, "v", "commit_files", _commit(await _sid(url, "v")))
+        assert not res.is_error, res.text
+        assert res.data is not None
+        assert res.data["author"] == "V <v@example.com>"
+        assert res.data["committer"] == "Lane MCP <lane-mcp@example.com>"
+    assert not [r for r in fake.requests if r.path.startswith("/api/v1/user")]
+
+
 # -- 8. OAuth state stays out of audit and spans ------------------------------------------------
 
 

@@ -166,6 +166,9 @@ class TenantConfig:
     branch_prefix: str = ""
     author_source: AuthorSource = AuthorSource.SERVICE_ACCOUNT
     author_header: str = ""
+    # "Name <email>" committing for the service account when someone else is
+    # the author. Unset, it is read from GET /user (needs read:user).
+    service_committer: str = ""
     agent_coauthor: str = DEFAULT_COAUTHOR
     rate_limit_per_minute: int = 120
     max_file_bytes: int = 1_000_000
@@ -365,6 +368,12 @@ def _tenant(raw: dict[str, Any]) -> TenantConfig:
     source = AuthorSource(raw.get("author_source", AuthorSource.SERVICE_ACCOUNT))
     if source is AuthorSource.TRUSTED_HEADER and not raw.get("author_header"):
         raise ConfigError(f"tenant {tid}: author_source=trusted_header needs author_header")
+    committer = str(raw.get("service_committer", "")).strip()
+    if committer:
+        if mode is not AuthMode.SERVICE_ACCOUNT:
+            raise ConfigError(f"tenant {tid}: service_committer needs auth_mode=service_account")
+        if not validation.IDENTITY.match(committer):
+            raise ConfigError(f"tenant {tid}: service_committer must be 'Name <email>'")
     oauth = None
     if "oauth" in raw:
         o = raw["oauth"]
@@ -415,6 +424,7 @@ def _tenant(raw: dict[str, Any]) -> TenantConfig:
         branch_prefix=str(raw.get("branch_prefix", "")),
         author_source=source,
         author_header=str(raw.get("author_header", "")).lower(),
+        service_committer=committer,
         agent_coauthor=str(raw.get("agent_coauthor", DEFAULT_COAUTHOR)),
         rate_limit_per_minute=int(raw.get("rate_limit_per_minute", 120)),
         max_file_bytes=int(raw.get("max_file_bytes", 1_000_000)),
