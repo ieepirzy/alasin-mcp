@@ -555,7 +555,14 @@ class _Context:
                 if len(buf) > MAX_COMMAND_BYTES:
                     raise ProtocolError("the push's command list is too long")
             if buf[:4] == FLUSH_PKT:
-                if await self._is_probe(chunks, buf):
+                # git's probe is the flush packet and nothing else. Read one
+                # more non-empty chunk at most; the except below drains the rest.
+                if len(buf) == len(FLUSH_PKT):
+                    async for chunk in chunks:
+                        if chunk:
+                            buf += chunk
+                            break
+                if buf == FLUSH_PKT:
                     return _probe_answer()
                 raise ProtocolError("the push names no refs")
             if head is None:
@@ -613,21 +620,6 @@ class _Context:
                 release()
 
         return await self.forward(body(), done)
-
-    async def _is_probe(self, chunks: AsyncIterator[bytes], buf: bytes) -> bool:
-        """Whether the whole request is a single flush packet, git's probe.
-
-        Reads the rest of the request: at most a few bytes when it is the
-        probe; otherwise (a malformed push) drains it, bounded, so the client
-        gets the 400."""
-        if len(buf) > len(FLUSH_PKT):
-            await self._drain(chunks, len(buf))
-            return False
-        async for chunk in chunks:
-            if chunk:
-                await self._drain(chunks, len(buf) + len(chunk))
-                return False
-        return True
 
     async def _drain(self, chunks: AsyncIterator[bytes], seen: int) -> None:
         """Read what is left of the request (bounded) so the client gets our answer."""
