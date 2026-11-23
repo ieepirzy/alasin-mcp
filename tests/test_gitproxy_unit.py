@@ -5,6 +5,7 @@ the refusal rules and the report-status answer."""
 from __future__ import annotations
 
 import base64
+from typing import Any, cast
 
 import pytest
 from starlette.requests import ClientDisconnect, Request
@@ -224,8 +225,10 @@ class _Probe:
         tenant = types.SimpleNamespace(service_token=types.SimpleNamespace(resolve=lambda: "s"))
         grant = GitToken("t", "sub", None, "acme/site", "lane/x", "s1", 9e9)
         scope = {"type": "http", "method": "POST", "path": "/", "headers": [], "query_string": b""}
+        request = Request(scope, receive)
+        # Duck-typed stand-ins: _Context reads only these attributes of each.
         self.ctx = _Context(
-            services, tenant, grant, Request(scope, receive), "http://f/", max_bytes
+            cast(Any, services), cast(Any, tenant), grant, request, "http://f/", max_bytes
         )
 
     async def push(self):  # noqa: ANN201

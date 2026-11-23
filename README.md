@@ -95,9 +95,9 @@ git push origin lane/change-1a2b3c4d
   forwarded; the server builds `?service=` itself. Before a push larger than
   `http.postBuffer` (1 MiB by default) git sends a probe, a `git-receive-pack`
   POST holding only a flush packet (`0000`); it is answered `200` with an empty
-  body, as `git http-backend` answers it, and never forwarded or audited. A missing or expired credential gets
-  `401` with a Basic challenge; one client address may fail 30 times a minute before it
-  gets `429` (successes don't count: sandboxes share addresses).
+  body, as `git http-backend` answers it, and never forwarded or audited. A
+  missing or expired credential gets `401` with a Basic challenge; one client
+  address may fail 30 times a minute before it gets `429` (successes don't count: sandboxes share addresses).
 - **Forwarding:** to the tenant's Forgejo with the tenant's service token (re-read on
   every request); the caller's credential never leaves the server. Request and response
   bodies are streamed; a push is capped at `max_push_bytes`.
