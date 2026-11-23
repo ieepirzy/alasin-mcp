@@ -270,7 +270,8 @@ async def test_failed_checks_review_fixes() -> None:
             "annotations_unavailable": True,
         },
     ]
-    status = {**PR, "checks": "failure", "failed_checks": failed, "failed_checks_truncated": True}
+    # No truncation flag from the service: trimming the oversized entry sets it.
+    status = {**PR, "checks": "failure", "failed_checks": failed}
     for url, _ in running(_fake(), FakeProposer(status=status)):
         pr = (await _status(url))["pull_request"]
         # The oversized entry is kept without its summary and annotations, and
@@ -281,6 +282,13 @@ async def test_failed_checks_review_fixes() -> None:
         assert lint["details_url"] == "https://github.com/acme/site/actions/runs/3"
         assert lint["annotations_unavailable"] is True
         assert pr["failed_checks_truncated"] is True
+    # Non-dict annotation items are not a truncation.
+    junk = [{"name": "t", "annotations": ["x", 1, None, "y", "z", "w"]}]
+    for url, _ in running(
+        _fake(), FakeProposer(status={**PR, "checks": "failure", "failed_checks": junk})
+    ):
+        pr = (await _status(url))["pull_request"]
+        assert pr["failed_checks"][0]["annotations"] == [] and "failed_checks_truncated" not in pr
     # The service's own truncation flag reaches the model, and the note is
     # there whenever failed_checks is, even empty.
     status = {**PR, "checks": "failure", "failed_checks": [], "failed_checks_truncated": True}

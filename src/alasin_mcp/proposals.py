@@ -140,14 +140,15 @@ def failed_checks(raw: Any, truncated: bool = False) -> tuple[list[dict[str, Any
     budget = FAILED_CHECKS_BUDGET
     for item in items[:FAILED_CHECKS_MAX]:
         notes = item.get("annotations")
-        if isinstance(notes, list) and len(notes) > FAILED_ANNOTATIONS_MAX:
+        notes = [a for a in notes if isinstance(a, dict)] if isinstance(notes, list) else []
+        if len(notes) > FAILED_ANNOTATIONS_MAX:
             truncated = True
         for entry in (_check_entry(item), _check_entry(item, annotations=False)):
             size = len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
             if size <= budget:
                 budget -= size
                 out.append(entry)
-                if not entry["annotations"] and item.get("annotations"):
+                if not entry["annotations"] and notes:
                     truncated = True
                 break
         else:
