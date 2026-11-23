@@ -171,6 +171,45 @@ async def test_clone_commit_push_through_the_proxy(
     assert tool_events and "clone_url" not in json.dumps(tool_events)
 
 
+async def test_a_push_larger_than_git_post_buffer(
+    forgejo: fj.Forgejo, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A push over http.postBuffer (1 MiB by default) makes git send a probe
+    first: a receive-pack POST whose whole body is a flush packet. It must
+    pass, or git gives up with "RPC failed; HTTP 400" before the real push."""
+    with server(forgejo, monkeypatch) as (url, audit, _):
+        sid = (await ok(url, "begin_change", {"intent": "images"}))["session_id"]
+        access = await ok(url, "git_access", {"session_id": sid, "repo": "acme/site"})
+        branch = access["branch"]
+        work = clone(tmp_path, access)
+        (work / "og").mkdir()
+        for i in range(3):  # incompressible, like PNGs: about 2.25 MiB of pack
+            (work / "og" / f"page-{i}.png").write_bytes(os.urandom(768 * 1024))
+        git(work, "add", "og")
+        git(work, "commit", "-m", "Add preview images")
+        local = git(work, "rev-parse", "HEAD").stdout.strip()
+        push = git(work, "push", "origin", branch, check=False)
+        assert push.returncode == 0, push.stderr
+        assert branch_head(forgejo, branch) == local
+
+        # The probe by hand, and a flush with anything after it, which is no
+        # probe but a push that names no refs.
+        endpoint = access["clone_url"].replace("x-token:", "")
+        cred = endpoint.split("//", 1)[1].split("@", 1)[0]
+        endpoint = endpoint.replace(f"{cred}@", "") + "/git-receive-pack"
+        headers = {"Content-Type": "application/x-git-receive-pack-request"}
+        probe = httpx.post(endpoint, content=b"0000", headers=headers, auth=("x", cred))
+        assert probe.status_code == 200 and probe.content == b""
+        bad = httpx.post(endpoint, content=b"0000PACK", headers=headers, auth=("x", cred))
+        assert bad.status_code == 400 and "names no refs" in bad.text
+        assert branch_head(forgejo, branch) == local
+
+    pushes = [e for e in audit.events if e.get("action") == "git_push"]
+    # The probes are not pushes: one attempt and one outcome, for the real one.
+    assert [e["phase"] for e in pushes] == ["attempt", "outcome"]
+    assert pushes[1]["outcome"] == "ok"
+
+
 async def test_pushes_outside_the_grant_are_refused(
     forgejo: fj.Forgejo, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
