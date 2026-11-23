@@ -20,7 +20,11 @@ Answers:
 Status: ``POST <url>/status`` with ``{"tenant", "repo", "branch"}``, signed the
 same way though it only reads (the body names the branch). **200**
 ``{"proposed": false}`` or ``{"proposed": true, "pull_request", "number",
-"state", "draft", "head_sha", "review", "checks"}``.
+"state", "draft", "head_sha", "review", "checks"}``, plus ``"failed_checks"``
+when ``checks`` is ``failure``: ``[{"name", "conclusion", "title", "summary",
+"details_url", "annotations": [{"path", "line", "message"}]}]``. That text is
+written by the pull request's own CI jobs: it is cleaned, capped and kept
+within ``FAILED_CHECKS_BUDGET`` here, and reaches the model as data.
 """
 
 from __future__ import annotations
@@ -75,6 +79,52 @@ def _signed(cfg: ProposalsConfig, payload: dict[str, Any]) -> tuple[bytes, dict[
 # The status fields passed on, each a short string, int or bool.
 _STATUS_KEYS = ("pull_request", "number", "state", "draft", "head_sha", "review", "checks")
 
+# failed_checks: at most this many checks with this many annotations each,
+# all within this many bytes of JSON (a share of change_status's budget).
+FAILED_CHECKS_MAX = 10
+FAILED_ANNOTATIONS_MAX = 5
+FAILED_CHECKS_BUDGET = 8_000
+
+
+def failed_checks(raw: Any) -> tuple[list[dict[str, Any]], bool]:
+    """The proposal service's ``failed_checks``, cleaned and bounded: the
+    entries that fit, and whether any were left out."""
+    if not isinstance(raw, list):
+        return [], False
+    out: list[dict[str, Any]] = []
+    budget = FAILED_CHECKS_BUDGET
+    truncated = len(raw) > FAILED_CHECKS_MAX
+    for item in raw[:FAILED_CHECKS_MAX]:
+        if not isinstance(item, dict):
+            continue
+        notes = item.get("annotations")
+        notes = [a for a in notes if isinstance(a, dict)] if isinstance(notes, list) else []
+        truncated = truncated or len(notes) > FAILED_ANNOTATIONS_MAX
+        entry = {
+            "name": _clean(item.get("name") or "", 200),
+            "conclusion": _clean(item.get("conclusion") or "", 30),
+            "title": _clean(item.get("title") or "", 300),
+            "summary": _clean(item.get("summary") or "", 500),
+            "details_url": _clean(item.get("details_url") or "", 500),
+            "annotations": [
+                {
+                    "path": _clean(a.get("path") or "", 300),
+                    "line": a["line"]
+                    if isinstance(a.get("line"), int) and not isinstance(a.get("line"), bool)
+                    else None,
+                    "message": _clean(a.get("message") or "", 300),
+                }
+                for a in notes[:FAILED_ANNOTATIONS_MAX]
+            ],
+        }
+        size = len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
+        if size > budget:
+            truncated = True
+            break
+        budget -= size
+        out.append(entry)
+    return out, truncated
+
 
 async def status(
     cfg: ProposalsConfig,
@@ -110,6 +160,11 @@ async def status(
             result[key] = v
         elif isinstance(v, str):
             result[key] = _clean(v)
+    if result.get("checks") == "failure" and "failed_checks" in out:
+        checks, truncated = failed_checks(out["failed_checks"])
+        result["failed_checks"] = checks
+        if truncated:
+            result["failed_checks_truncated"] = True
     return result
 
 
