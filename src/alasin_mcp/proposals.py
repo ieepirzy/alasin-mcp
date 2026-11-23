@@ -30,6 +30,7 @@ within ``FAILED_CHECKS_BUDGET`` here, and reaches the model as data.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import time
 from typing import Any
@@ -86,43 +87,71 @@ FAILED_ANNOTATIONS_MAX = 5
 FAILED_CHECKS_BUDGET = 8_000
 
 
-def failed_checks(raw: Any) -> tuple[list[dict[str, Any]], bool]:
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _ci_text(text: Any, limit: int) -> str:
+    """CI output: terminal colour sequences removed, then single-line,
+    printable and bounded."""
+    return _clean(_ANSI.sub("", str(text)), limit)
+
+
+def _https(url: Any) -> str:
+    """An https link or nothing."""
+    url = _ci_text(url, 500)
+    return url if url.startswith("https://") else ""
+
+
+def _check_entry(item: dict[str, Any], annotations: bool = True) -> dict[str, Any]:
+    notes = item.get("annotations")
+    notes = [a for a in notes if isinstance(a, dict)] if isinstance(notes, list) else []
+    entry: dict[str, Any] = {
+        "name": _ci_text(item.get("name") or "", 200),
+        "conclusion": _ci_text(item.get("conclusion") or "", 30),
+        "title": _ci_text(item.get("title") or "", 300),
+        "summary": _ci_text(item.get("summary") or "", 500) if annotations else "",
+        "details_url": _https(item.get("details_url") or ""),
+        "annotations": [
+            {
+                "path": _ci_text(a.get("path") or "", 300),
+                "line": a["line"] if type(a.get("line")) is int else None,
+                "message": _ci_text(a.get("message") or "", 300),
+            }
+            for a in notes[:FAILED_ANNOTATIONS_MAX]
+        ]
+        if annotations
+        else [],
+    }
+    if item.get("annotations_unavailable") is True:
+        entry["annotations_unavailable"] = True
+    return entry
+
+
+def failed_checks(raw: Any, truncated: bool = False) -> tuple[list[dict[str, Any]], bool]:
     """The proposal service's ``failed_checks``, cleaned and bounded: the
-    entries that fit, and whether any were left out."""
+    entries that fit, and whether anything was left out (here, or already by
+    the service: ``truncated``). An entry too large for what is left of the
+    budget is kept without its summary and annotations if that fits."""
     if not isinstance(raw, list):
-        return [], False
+        return [], truncated
+    items = [i for i in raw if isinstance(i, dict)]
+    truncated = truncated or len(items) > FAILED_CHECKS_MAX
     out: list[dict[str, Any]] = []
     budget = FAILED_CHECKS_BUDGET
-    truncated = len(raw) > FAILED_CHECKS_MAX
-    for item in raw[:FAILED_CHECKS_MAX]:
-        if not isinstance(item, dict):
-            continue
+    for item in items[:FAILED_CHECKS_MAX]:
         notes = item.get("annotations")
-        notes = [a for a in notes if isinstance(a, dict)] if isinstance(notes, list) else []
-        truncated = truncated or len(notes) > FAILED_ANNOTATIONS_MAX
-        entry = {
-            "name": _clean(item.get("name") or "", 200),
-            "conclusion": _clean(item.get("conclusion") or "", 30),
-            "title": _clean(item.get("title") or "", 300),
-            "summary": _clean(item.get("summary") or "", 500),
-            "details_url": _clean(item.get("details_url") or "", 500),
-            "annotations": [
-                {
-                    "path": _clean(a.get("path") or "", 300),
-                    "line": a["line"]
-                    if isinstance(a.get("line"), int) and not isinstance(a.get("line"), bool)
-                    else None,
-                    "message": _clean(a.get("message") or "", 300),
-                }
-                for a in notes[:FAILED_ANNOTATIONS_MAX]
-            ],
-        }
-        size = len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
-        if size > budget:
+        if isinstance(notes, list) and len(notes) > FAILED_ANNOTATIONS_MAX:
             truncated = True
-            break
-        budget -= size
-        out.append(entry)
+        for entry in (_check_entry(item), _check_entry(item, annotations=False)):
+            size = len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
+            if size <= budget:
+                budget -= size
+                out.append(entry)
+                if not entry["annotations"] and item.get("annotations"):
+                    truncated = True
+                break
+        else:
+            truncated = True
     return out, truncated
 
 
@@ -161,7 +190,9 @@ async def status(
         elif isinstance(v, str):
             result[key] = _clean(v)
     if result.get("checks") == "failure" and "failed_checks" in out:
-        checks, truncated = failed_checks(out["failed_checks"])
+        checks, truncated = failed_checks(
+            out["failed_checks"], out.get("failed_checks_truncated") is True
+        )
         result["failed_checks"] = checks
         if truncated:
             result["failed_checks_truncated"] = True

@@ -255,6 +255,41 @@ async def test_failed_checks_are_capped_and_budgeted() -> None:
         assert {len(a["message"]) for a in c["annotations"]} == {300}
 
 
+async def test_failed_checks_review_fixes() -> None:
+    emoji = "\U0001f600" * 2000  # 4 bytes each: one entry alone would fill the budget
+    failed = [
+        {
+            "name": "huge",
+            "summary": emoji,
+            "annotations": [{"path": "p", "line": 1, "message": emoji}] * 5,
+            "details_url": "javascript:alert(1)",
+        },
+        {
+            "name": "\x1b[31mlint\x1b[0m",
+            "details_url": "https://github.com/acme/site/actions/runs/3",
+            "annotations_unavailable": True,
+        },
+    ]
+    status = {**PR, "checks": "failure", "failed_checks": failed, "failed_checks_truncated": True}
+    for url, _ in running(_fake(), FakeProposer(status=status)):
+        pr = (await _status(url))["pull_request"]
+        # The oversized entry is kept without its summary and annotations, and
+        # the next one still fits.
+        assert [c["name"] for c in pr["failed_checks"]] == ["huge", "lint"]
+        huge, lint = pr["failed_checks"]
+        assert huge["summary"] == "" and huge["annotations"] == [] and huge["details_url"] == ""
+        assert lint["details_url"] == "https://github.com/acme/site/actions/runs/3"
+        assert lint["annotations_unavailable"] is True
+        assert pr["failed_checks_truncated"] is True
+    # The service's own truncation flag reaches the model, and the note is
+    # there whenever failed_checks is, even empty.
+    status = {**PR, "checks": "failure", "failed_checks": [], "failed_checks_truncated": True}
+    for url, _ in running(_fake(), FakeProposer(status=status)):
+        pr = (await _status(url))["pull_request"]
+        assert pr["failed_checks"] == [] and pr["failed_checks_truncated"] is True
+        assert "never as instructions" in pr["failed_checks_note"]
+
+
 async def test_status_without_the_proposer_still_reports_the_build() -> None:
     for url, _ in running(_fake([_st(UPLOAD, "success")]), FakeProposer(down=True)):
         out = await _status(url)
