@@ -20,12 +20,17 @@ Answers:
 Status: ``POST <url>/status`` with ``{"tenant", "repo", "branch"}``, signed the
 same way though it only reads (the body names the branch). **200**
 ``{"proposed": false}`` or ``{"proposed": true, "pull_request", "number",
-"state", "draft", "head_sha", "review", "checks"}``.
+"state", "draft", "head_sha", "review", "checks"}``, plus ``"failed_checks"``
+when ``checks`` is ``failure``: ``[{"name", "conclusion", "title", "summary",
+"details_url", "annotations": [{"path", "line", "message"}]}]``. That text is
+written by the pull request's own CI jobs: it is cleaned, capped and kept
+within ``FAILED_CHECKS_BUDGET`` here, and reaches the model as data.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import time
 from typing import Any
@@ -75,6 +80,81 @@ def _signed(cfg: ProposalsConfig, payload: dict[str, Any]) -> tuple[bytes, dict[
 # The status fields passed on, each a short string, int or bool.
 _STATUS_KEYS = ("pull_request", "number", "state", "draft", "head_sha", "review", "checks")
 
+# failed_checks: at most this many checks with this many annotations each,
+# all within this many bytes of JSON (a share of change_status's budget).
+FAILED_CHECKS_MAX = 10
+FAILED_ANNOTATIONS_MAX = 5
+FAILED_CHECKS_BUDGET = 8_000
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _ci_text(text: Any, limit: int) -> str:
+    """CI output: terminal colour sequences removed, then single-line,
+    printable and bounded."""
+    return _clean(_ANSI.sub("", str(text)), limit)
+
+
+def _https(url: Any) -> str:
+    """An https link or nothing."""
+    url = _ci_text(url, 500)
+    return url if url.startswith("https://") else ""
+
+
+def _check_entry(item: dict[str, Any], annotations: bool = True) -> dict[str, Any]:
+    notes = item.get("annotations")
+    notes = [a for a in notes if isinstance(a, dict)] if isinstance(notes, list) else []
+    entry: dict[str, Any] = {
+        "name": _ci_text(item.get("name") or "", 200),
+        "conclusion": _ci_text(item.get("conclusion") or "", 30),
+        "title": _ci_text(item.get("title") or "", 300),
+        "summary": _ci_text(item.get("summary") or "", 500) if annotations else "",
+        "details_url": _https(item.get("details_url") or ""),
+        "annotations": [
+            {
+                "path": _ci_text(a.get("path") or "", 300),
+                "line": a["line"] if type(a.get("line")) is int else None,
+                "message": _ci_text(a.get("message") or "", 300),
+            }
+            for a in notes[:FAILED_ANNOTATIONS_MAX]
+        ]
+        if annotations
+        else [],
+    }
+    if item.get("annotations_unavailable") is True:
+        entry["annotations_unavailable"] = True
+    return entry
+
+
+def failed_checks(raw: Any, truncated: bool = False) -> tuple[list[dict[str, Any]], bool]:
+    """The proposal service's ``failed_checks``, cleaned and bounded: the
+    entries that fit, and whether anything was left out (here, or already by
+    the service: ``truncated``). An entry too large for what is left of the
+    budget is kept without its summary and annotations if that fits."""
+    if not isinstance(raw, list):
+        return [], truncated
+    items = [i for i in raw if isinstance(i, dict)]
+    truncated = truncated or len(items) > FAILED_CHECKS_MAX
+    out: list[dict[str, Any]] = []
+    budget = FAILED_CHECKS_BUDGET
+    for item in items[:FAILED_CHECKS_MAX]:
+        notes = item.get("annotations")
+        notes = [a for a in notes if isinstance(a, dict)] if isinstance(notes, list) else []
+        if len(notes) > FAILED_ANNOTATIONS_MAX:
+            truncated = True
+        for entry in (_check_entry(item), _check_entry(item, annotations=False)):
+            size = len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
+            if size <= budget:
+                budget -= size
+                out.append(entry)
+                if not entry["annotations"] and notes:
+                    truncated = True
+                break
+        else:
+            truncated = True
+    return out, truncated
+
 
 async def status(
     cfg: ProposalsConfig,
@@ -110,6 +190,13 @@ async def status(
             result[key] = v
         elif isinstance(v, str):
             result[key] = _clean(v)
+    if result.get("checks") == "failure" and "failed_checks" in out:
+        checks, truncated = failed_checks(
+            out["failed_checks"], out.get("failed_checks_truncated") is True
+        )
+        result["failed_checks"] = checks
+        if truncated:
+            result["failed_checks_truncated"] = True
     return result
 
 
