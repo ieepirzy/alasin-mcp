@@ -5,6 +5,7 @@ the refusal rules and the report-status answer."""
 from __future__ import annotations
 
 import base64
+from typing import Any, cast
 
 import pytest
 from starlette.requests import ClientDisconnect, Request
@@ -182,3 +183,87 @@ async def test_finishing_response_finishes_when_never_iterated() -> None:
     assert finished == [True]
     await r.finish()  # idempotent
     assert finished == [True]
+
+
+# --------------------------------------------------------------------------
+# git's probe: a receive-pack request that is only a flush packet
+# --------------------------------------------------------------------------
+class _Probe:
+    """A _Context.push run with a recording upstream and audit, no network."""
+
+    def __init__(self, chunks: list[bytes], max_bytes: int = 1000):
+        import types
+
+        import httpx
+
+        from alasin_mcp.gitproxy import _Context
+        from alasin_mcp.store import GitToken
+
+        self.forwarded: list[bytes] = []
+        self.events: list[dict] = []
+        self.released = 0
+        self.read = 0
+        messages = [
+            {"type": "http.request", "body": c, "more_body": i < len(chunks) - 1}
+            for i, c in enumerate(chunks)
+        ]
+
+        async def receive() -> dict:
+            message = messages.pop(0) if messages else {"type": "http.disconnect"}
+            self.read += len(message.get("body", b""))
+            return message
+
+        def upstream(req: httpx.Request) -> httpx.Response:
+            self.forwarded.append(req.content)
+            return httpx.Response(200)
+
+        services = types.SimpleNamespace(
+            client_ip=types.SimpleNamespace(client_ip=lambda _request: "192.0.2.1"),
+            audit_sink=types.SimpleNamespace(emit=self.events.append),
+            transport=httpx.MockTransport(upstream),
+        )
+        tenant = types.SimpleNamespace(service_token=types.SimpleNamespace(resolve=lambda: "s"))
+        grant = GitToken("t", "sub", None, "acme/site", "lane/x", "s1", 9e9)
+        scope = {"type": "http", "method": "POST", "path": "/", "headers": [], "query_string": b""}
+        request = Request(scope, receive)
+        # Duck-typed stand-ins: _Context reads only these attributes of each.
+        self.ctx = _Context(
+            cast(Any, services), cast(Any, tenant), grant, request, "http://f/", max_bytes
+        )
+
+    async def push(self):  # noqa: ANN201
+        def release() -> None:
+            self.released += 1
+
+        return await self.ctx.push(release)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "chunks",
+    [[b"0000"], [b"00", b"00"], [b"0", b"0", b"0", b"0"], [b"0000", b"", b""], [b"", b"0000"]],
+)
+async def test_the_probe_is_answered_here(chunks: list[bytes]) -> None:
+    p = _Probe(chunks)
+    r = await p.push()
+    assert (r.status_code, r.body) == (200, b"")
+    assert r.media_type == "application/x-git-receive-pack-result"
+    assert p.forwarded == [] and p.events == []  # not forwarded, not a push
+    assert p.released == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("chunks", [[b"0000PACK"], [b"0000", b"PACK"], [b"0000", b"", b"x"]])
+async def test_a_flush_with_anything_after_it_is_no_probe(chunks: list[bytes]) -> None:
+    p = _Probe(chunks)
+    r = await p.push()
+    assert r.status_code == 400 and b"names no refs" in r.body
+    assert p.forwarded == [] and p.events == []
+    assert p.released == 1
+
+
+@pytest.mark.anyio
+async def test_a_refused_flush_is_drained_once_within_the_cap() -> None:
+    p = _Probe([b"0000"] + [b"x" * 600] * 6, max_bytes=1000)
+    assert (await p.push()).status_code == 400
+    assert p.read <= 1000 + 600  # the cap, plus the chunk that crossed it

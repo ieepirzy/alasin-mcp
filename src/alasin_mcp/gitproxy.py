@@ -22,6 +22,10 @@ decides what the push may change (the lane's file patterns, force pushes).
 A read-only credential (``access="read"``, no branch) is refused every
 receive-pack route before anything is forwarded.
 
+Before a push larger than ``http.postBuffer`` git first sends a probe, a
+receive-pack request holding only a flush packet; it is answered here with
+200 and nothing else, as ``git http-backend`` answers it, and never forwarded.
+
 Each push writes an audit attempt event before it is forwarded (refused if
 the audit can't be written) and an outcome event after. A clone or fetch is
 recorded once, at its ``info/refs`` request, which every git fetch starts
@@ -71,6 +75,7 @@ _PKT_LEN = re.compile(rb"[0-9a-f]{4}")
 # push to one branch needs, and a bound on what is buffered before the check.
 MAX_COMMAND_BYTES = 64 * 1024
 MAX_PKT = 65520
+FLUSH_PKT = b"0000"
 # Request headers passed on to Forgejo; everything else (Authorization,
 # cookies, forwarding headers) stays here.
 _FORWARD_REQUEST = ("content-type", "content-encoding", "accept", "git-protocol", "user-agent")
@@ -373,6 +378,22 @@ class GitProxy:
         return response
 
 
+def _probe_answer() -> Response:
+    """What ``git http-backend`` answers to git's probe: 200, nothing in it.
+
+    git sends the probe (a receive-pack POST whose body is only ``0000``)
+    before a push larger than ``http.postBuffer`` (1 MiB by default), to
+    settle authentication before it streams a body it can't resend. It reads
+    only the status. Nothing is forwarded to Forgejo and nothing is pushed,
+    so it is no push to audit; the credential and the branch's owner have
+    already been checked by the time it is answered."""
+    return Response(
+        b"",
+        media_type="application/x-git-receive-pack-result",
+        headers={"cache-control": "no-cache"},
+    )
+
+
 class _BodyTooLarge(Exception):
     pass
 
@@ -526,11 +547,24 @@ class _Context:
         try:
             async for chunk in chunks:
                 buf += chunk
+                if buf[:4] == FLUSH_PKT:
+                    break  # git's probe, or a push naming no refs: see below
                 head = parse_push_head(buf)
                 if head is not None:
                     break
                 if len(buf) > MAX_COMMAND_BYTES:
                     raise ProtocolError("the push's command list is too long")
+            if buf[:4] == FLUSH_PKT:
+                # git's probe is the flush packet and nothing else. Read one
+                # more non-empty chunk at most; the except below drains the rest.
+                if len(buf) == len(FLUSH_PKT):
+                    async for chunk in chunks:
+                        if chunk:
+                            buf += chunk
+                            break
+                if buf == FLUSH_PKT:
+                    return _probe_answer()
+                raise ProtocolError("the push names no refs")
             if head is None:
                 head = parse_push_head(buf)
             if head is None:
