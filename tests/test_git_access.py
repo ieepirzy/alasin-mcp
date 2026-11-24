@@ -210,6 +210,37 @@ async def test_a_push_larger_than_git_post_buffer(
     assert pushes[1]["outcome"] == "ok"
 
 
+async def test_a_push_from_a_shallow_clone(
+    forgejo: fj.Forgejo, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The playbook clones with --depth 1; a push from that clone opens with
+    shallow lines and must reach Forgejo, not stop here with a 400."""
+    with server(forgejo, monkeypatch) as (url, audit, _):
+        sid = (await ok(url, "begin_change", {"intent": "shallow"}))["session_id"]
+        access = await ok(url, "git_access", {"session_id": sid, "repo": "acme/site"})
+        branch = access["branch"]
+        # A second commit on the branch, so that a depth-1 clone of it is shallow.
+        full = clone(tmp_path, access, "full")
+        (full / "index.html").write_text("<h1>One</h1>\n")
+        git(full, "commit", "-am", "One")
+        assert git(full, "push", "origin", branch, check=False).returncode == 0
+
+        git(tmp_path, "clone", "--depth", "1", "--branch", branch, access["clone_url"], "s")
+        work = tmp_path / "s"
+        assert git(work, "rev-parse", "--is-shallow-repository").stdout.strip() == "true"
+        for key, value in access["git_config"].items():
+            git(work, "config", key, value)
+        (work / "index.html").write_text("<h1>Two</h1>\n")
+        git(work, "commit", "-am", "Two")
+        local = git(work, "rev-parse", "HEAD").stdout.strip()
+        push = git(work, "push", "origin", branch, check=False)
+        assert push.returncode == 0, push.stderr
+        assert branch_head(forgejo, branch) == local
+
+    pushes = [e for e in audit.events if e.get("action") == "git_push"]
+    assert [e["outcome"] for e in pushes if e["phase"] == "outcome"] == ["ok", "ok"]
+
+
 async def test_pushes_outside_the_grant_are_refused(
     forgejo: fj.Forgejo, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

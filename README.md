@@ -103,7 +103,9 @@ git push origin lane/change-1a2b3c4d
   bodies are streamed; a push is capped at `max_push_bytes`.
 - **Pushes are checked before anything reaches Forgejo.** Every ref command must update
   exactly `refs/heads/<the credential's branch>`: no other branch, no tag, no new
-  branch, no deletion, no shallow or signed pushes. Capabilities are an allowlist
+  branch, no deletion, no signed pushes. A push from a shallow clone (the playbook's
+  `--depth 1`) is forwarded with its shallow lines, and Forgejo's receive-pack still
+  refuses one that would make the repository shallow. Capabilities are an allowlist
   (`report-status`, `report-status-v2`, `side-band-64k`, `side-band`, `quiet`, `atomic`,
   `ofs-delta`, `agent`, `object-format`, `session-id`, by name before any `=`): push
   options in particular are refused, because Forgejo applies options such as

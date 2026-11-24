@@ -105,6 +105,7 @@ class PushHead:
     commands: tuple[RefCommand, ...]
     capabilities: frozenset[str]
     length: int  # bytes of the request taken by the command list
+    shallow: int = 0  # shallow boundaries sent ahead of it: a push from a shallow clone
 
 
 def parse_push_head(buf: bytes) -> PushHead | None:
@@ -116,6 +117,7 @@ def parse_push_head(buf: bytes) -> PushHead | None:
     pos = 0
     commands: list[RefCommand] = []
     caps: frozenset[str] = frozenset()
+    shallow = 0
     while True:
         if len(buf) - pos < 4:
             if len(buf) > MAX_COMMAND_BYTES:
@@ -127,7 +129,7 @@ def parse_push_head(buf: bytes) -> PushHead | None:
         if size == 0:  # flush: end of the command list
             if not commands:
                 raise ProtocolError("the push names no refs")
-            return PushHead(tuple(commands), caps, pos + 4)
+            return PushHead(tuple(commands), caps, pos + 4, shallow)
         if size < 4 or size > MAX_PKT:
             raise ProtocolError("unsupported pkt-line")
         if pos + size > MAX_COMMAND_BYTES:
@@ -139,7 +141,17 @@ def parse_push_head(buf: bytes) -> PushHead | None:
         if line.endswith(b"\n"):
             line = line[:-1]
         if line.startswith(b"shallow "):
-            raise ProtocolError("pushes from a shallow clone are not supported")
+            # A push from a shallow clone (git_access's playbook clones with
+            # --depth 1) opens with its shallow boundaries, before any command.
+            # Forwarded as sent: Forgejo's receive-pack still checks the pack
+            # connects and refuses an update that would make it shallow.
+            if commands:
+                raise ProtocolError("malformed shallow line")
+            oid = line[len(b"shallow ") :]
+            if not _SHA.fullmatch(oid.decode("ascii", "replace")):
+                raise ProtocolError("malformed object id in shallow line")
+            shallow += 1
+            continue
         if line.startswith(b"push-cert"):
             raise ProtocolError("signed pushes are not supported")
         if not commands:
@@ -570,6 +582,9 @@ class _Context:
             if head is None:
                 raise ProtocolError("the push request ended early")
         except ProtocolError as e:
+            # git shows only "RPC failed; HTTP 400" for a POST, never this body,
+            # so the reason is logged here too (fixed text, nothing from the request).
+            log.warning("git push refused as malformed: %s", e)
             await self._drain(chunks, len(buf))
             return PlainTextResponse(f"{e}\n", status_code=400)
         refs = [{"old_sha": c.old, "new_sha": c.new} for c in head.commands]

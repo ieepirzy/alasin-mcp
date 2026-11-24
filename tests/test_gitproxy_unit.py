@@ -42,6 +42,26 @@ def test_parses_one_command_with_capabilities() -> None:
     assert body[head.length :] == b"PACK...."
 
 
+def test_a_push_from_a_shallow_clone_is_parsed() -> None:
+    """What git sends from a --depth 1 clone (as git_access's playbook makes):
+    its shallow boundaries first, then the commands. Captured from git 2.43."""
+    caps = b"report-status-v2 side-band-64k quiet object-format=sha1 agent=git/2.43.0"
+    body = (
+        pkt(b"shallow " + A.encode() + b"\n")
+        + cmd(A, B, "refs/heads/lane/x", caps)
+        + b"0000"
+        + b"PACK...."
+    )
+    head = parse_push_head(body)
+    assert head is not None and head.shallow == 1
+    assert [(c.old, c.new, c.ref) for c in head.commands] == [(A, B, "refs/heads/lane/x")]
+    assert "report-status-v2" in head.capabilities
+    assert body[head.length :] == b"PACK...."
+    assert refusal(head, "lane/x") is None
+    for cut in (3, 20, len(body) - 12):
+        assert parse_push_head(body[:cut]) is None, cut
+
+
 def test_partial_input_asks_for_more() -> None:
     body = cmd(A, B, "refs/heads/lane/x", CAPS) + b"0000"
     for cut in (0, 3, 10, len(body) - 4, len(body) - 1):
@@ -57,7 +77,9 @@ def test_partial_input_asks_for_more() -> None:
         b"0001",  # delimiter packet: protocol v2, not a push
         b"+00a",  # sign in the length
         b"0000",  # flush with no commands
-        pkt(b"shallow " + A.encode() + b"\n") + b"0000",
+        pkt(b"shallow " + A.encode() + b"\n") + b"0000",  # shallow lines but no refs
+        pkt(b"shallow nothex\n") + cmd(A, B, "refs/heads/x", CAPS) + b"0000",
+        cmd(A, B, "refs/heads/x", CAPS) + pkt(b"shallow " + A.encode() + b"\n") + b"0000",
         pkt(b"push-cert\0" + CAPS + b"\n") + b"0000",
         pkt(f"{A} {B}".encode() + b"\n") + b"0000",  # two fields
         pkt(f"{A} nothex refs/heads/x".encode() + b"\n") + b"0000",
